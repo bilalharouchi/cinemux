@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Remuxer, type Diagnostic } from "../src/remuxer";
+import { Remuxer, type Diagnostic } from "../src/remuxer.js";
 
 /**
  * Les cas qui cassent vraiment un remuxeur : images B (DTS ≠ PTS), HEVC (chaîne

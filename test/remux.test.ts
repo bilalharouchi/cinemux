@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Remuxer, type Diagnostic } from "../src/remuxer";
+import { Remuxer, type Diagnostic } from "../src/remuxer.js";
 
 /**
  * Ces tests jugent la sortie avec ffprobe, pas avec mes propres convictions.
@@ -164,12 +164,12 @@ describe("remux MKV → fMP4", () => {
   });
 
   it("l'audio AC-3 est analysé correctement depuis le flux", async () => {
-    const { analyserAc3 } = await import("../src/codecs");
+    const { analyserAc3 } = await import("../src/codecs/index.js");
     // Première trame AC-3 de la fixture, extraite via le démultiplexeur.
-    const { MatroskaDemuxer } = await import("../src/matroska/demuxer");
+    const { MatroskaDemuxer } = await import("../src/matroska/demuxer.js");
     let trame: Uint8Array | null = null;
     const d = new MatroskaDemuxer({
-      onEchantillon: (e) => {
+      onEchantillon: (e: { piste: number; donnees: Uint8Array }) => {
         if (!trame && e.piste === 2) trame = e.donnees;
       },
     });

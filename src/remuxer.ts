@@ -1,6 +1,6 @@
-import { MatroskaDemuxer, type Echantillon, type Piste } from "./matroska/demuxer";
-import { TrackType } from "./ebml/ids";
-import { CodecNonSupporte, decrire, mimeDe, type Description } from "./codecs";
+import { MatroskaDemuxer, type Echantillon, type Piste } from "./matroska/demuxer.js";
+import { TrackType } from "./ebml/ids.js";
+import { CodecNonSupporte, decrire, mimeDe, type Description } from "./codecs/index.js";
 import {
   reconstruireDts,
   segmentInit,
@@ -8,7 +8,7 @@ import {
   type EchantillonMux,
   type FragmentPiste,
   type PisteMux,
-} from "./mp4/muxer";
+} from "./mp4/muxer.js";
 
 /**
  * Remux Matroska → fMP4.
@@ -30,8 +30,14 @@ export type Diagnostic = {
   audio: PisteChoisie | null;
   /** Pistes écartées, avec la raison — l'utilisateur a droit à une explication. */
   ecartees: { piste: Piste; raison: string }[];
-  /** Type MIME complet passé à MediaSource. */
+  /** Type MIME des pistes RÉELLEMENT muxées. */
   mime: string;
+  /**
+   * Vrai quand le fichier a une piste audio qu'aucun décodeur du navigateur ne
+   * prend : l'image jouera, mais en silence. À l'appelant de proposer une autre
+   * version plutôt que de laisser l'utilisateur devant un film muet.
+   */
+  audioMuet: boolean;
   dureeMs: number | null;
 };
 
@@ -218,8 +224,26 @@ export class Remuxer {
       this.muxVideo = { id: id++, description: this.video.description };
       pistes.push(this.muxVideo);
     }
-    if (this.audio) {
-      this.muxAudio = { id: id++, description: this.audio.description };
+
+    /**
+     * Une piste audio que le navigateur ne décode pas est EXCLUE du muxage.
+     *
+     * POURQUOI — `MediaSource.isTypeSupported` juge la chaîne COMPLÈTE : un
+     * `hvc1.2.4.H150.B0,ac-3` est refusé en bloc, alors que la vidéo seule
+     * passerait. La garder condamnait tout le fichier à cause du son.
+     *
+     * Elle reste dans le diagnostic avec `supportee: false` : l'appelant sait
+     * qu'il y a du son qu'il ne peut pas jouer, et peut proposer autre chose.
+     */
+    const audioJouable = this.audio?.supportee ? this.audio : null;
+    if (this.audio && !audioJouable) {
+      ecartees.push({
+        piste: this.audio.piste,
+        raison: `${this.audio.piste.codecId} non décodable par ce navigateur — image conservée, son muet`,
+      });
+    }
+    if (audioJouable) {
+      this.muxAudio = { id: id++, description: audioJouable.description };
       pistes.push(this.muxAudio);
     }
 
@@ -234,7 +258,11 @@ export class Remuxer {
       video: this.video,
       audio: this.audio,
       ecartees,
+      // Ne décrit que ce qui est réellement muxé : inclure une piste exclue
+      // ferait échouer `isTypeSupported` sur un flux qui, lui, passerait.
       mime: mimeDe(...descriptions),
+      /** Le fichier a du son, mais ce navigateur ne sait pas le décoder. */
+      audioMuet: this.audio != null && !this.audio.supportee,
       dureeMs: this.demuxer.dureeMs,
     };
 

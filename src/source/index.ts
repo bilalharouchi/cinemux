@@ -23,5 +23,5 @@ export interface Source {
   lire(debut: number, fin: number, signal?: AbortSignal): Promise<Uint8Array>;
 }
 
-export { SourceHttp } from "./http";
-export { SourceBlob } from "./blob";
+export { SourceHttp } from "./http.js";
+export { SourceBlob } from "./blob.js";

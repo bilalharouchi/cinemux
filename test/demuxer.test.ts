@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
-import { MatroskaDemuxer, type Echantillon, type Piste } from "../src/matroska/demuxer";
-import { TrackType } from "../src/ebml/ids";
+import { MatroskaDemuxer, type Echantillon, type Piste } from "../src/matroska/demuxer.js";
+import { TrackType } from "../src/ebml/ids.js";
 
 /**
  * Les fixtures sont produites par ffmpeg (voir test/fixtures/README.md) : ce sont

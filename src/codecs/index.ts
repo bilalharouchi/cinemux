@@ -1,5 +1,5 @@
-import { boite, joindre, u16, u32, u8, descripteur, pleine } from "../mp4/box";
-import type { Piste } from "../matroska/demuxer";
+import { boite, joindre, u16, u32, u8, descripteur, pleine } from "../mp4/box.js";
+import type { Piste } from "../matroska/demuxer.js";
 
 /**
  * Traduction Matroska → MP4 : entrée d'échantillon (« sample entry ») et chaîne

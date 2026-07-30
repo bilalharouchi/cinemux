@@ -1,4 +1,4 @@
-import type { Source } from "./index";
+import type { Source } from "./index.js";
 
 /**
  * Source HTTP avec requêtes partielles (`Range`).

@@ -1,7 +1,7 @@
-import { Remuxer, type Diagnostic } from "./remuxer";
-import { MatroskaDemuxer, type PointCue } from "./matroska/demuxer";
-import { ID } from "./ebml/ids";
-import type { Source } from "./source";
+import { Remuxer, type Diagnostic } from "./remuxer.js";
+import { MatroskaDemuxer, type PointCue } from "./matroska/demuxer.js";
+import { ID } from "./ebml/ids.js";
+import type { Source } from "./source/index.js";
 
 /**
  * Branche un MKV sur un `<video>` via MediaSource.
@@ -156,12 +156,15 @@ export class Cinemux {
 
         if (!this.sourceBuffer && this.mediaSource?.readyState === "open") {
           if (!MediaSource.isTypeSupported(diag.mime)) {
+            // `diag.mime` ne décrit déjà plus que les pistes muxées : si ça échoue
+            // encore, c'est la VIDÉO que ce navigateur ne prend pas.
+            const v = diag.video;
             this.opt.onErreur?.(
               new Error(
-                `codecs non supportés par ce navigateur : ${diag.mime}` +
-                  (diag.audio && !diag.audio.supportee
-                    ? ` — la piste audio ${diag.audio.piste.codecId} n'est pas décodable ici`
-                    : ""),
+                v
+                  ? `Ce navigateur ne décode pas cette vidéo (${v.piste.codecId} → ${v.description.codec}). ` +
+                    "Sur un autre appareil ou une autre version, elle passerait."
+                  : `Aucun codec exploitable : ${diag.mime}`,
               ),
             );
             return;

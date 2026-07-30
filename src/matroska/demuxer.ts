@@ -1,6 +1,6 @@
-import { EbmlReader, UNKNOWN_SIZE } from "../ebml/reader";
-import { ID, MASTER_ELEMENTS, TrackType } from "../ebml/ids";
-import { decoderBloc } from "./blocks";
+import { EbmlReader, UNKNOWN_SIZE } from "../ebml/reader.js";
+import { ID, MASTER_ELEMENTS, TrackType } from "../ebml/ids.js";
+import { decoderBloc } from "./blocks.js";
 
 /**
  * Démultiplexeur Matroska **en flux**.

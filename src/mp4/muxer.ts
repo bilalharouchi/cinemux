@@ -1,5 +1,5 @@
-import { boite, joindre, pleine, u16, u32, u64, u8, fourcc } from "./box";
-import type { Description } from "../codecs";
+import { boite, joindre, pleine, u16, u32, u64, u8, fourcc } from "./box.js";
+import type { Description } from "../codecs/index.js";
 
 /**
  * Écriture de fMP4 (MP4 fragmenté) pour MediaSource.

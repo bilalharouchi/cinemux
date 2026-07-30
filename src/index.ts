@@ -22,18 +22,18 @@
  * ```
  */
 
-export { Cinemux, type OptionsLecture } from "./player";
-export { Remuxer, type Diagnostic, type PisteChoisie, type OptionsRemuxer } from "./remuxer";
-export { SourceHttp } from "./source/http";
-export { SourceBlob } from "./source/blob";
-export type { Source } from "./source";
+export { Cinemux, type OptionsLecture } from "./player.js";
+export { Remuxer, type Diagnostic, type PisteChoisie, type OptionsRemuxer } from "./remuxer.js";
+export { SourceHttp } from "./source/http.js";
+export { SourceBlob } from "./source/blob.js";
+export type { Source } from "./source/index.js";
 
-export { MatroskaDemuxer } from "./matroska/demuxer";
-export type { Piste, Echantillon, PointCue } from "./matroska/demuxer";
-export { TrackType } from "./ebml/ids";
+export { MatroskaDemuxer } from "./matroska/demuxer.js";
+export type { Piste, Echantillon, PointCue } from "./matroska/demuxer.js";
+export { TrackType } from "./ebml/ids.js";
 
-export { decrire, analyserAc3, mimeDe, CodecNonSupporte, type Description } from "./codecs";
-export { segmentInit, segmentMedia, reconstruireDts } from "./mp4/muxer";
+export { decrire, analyserAc3, mimeDe, CodecNonSupporte, type Description } from "./codecs/index.js";
+export { segmentInit, segmentMedia, reconstruireDts } from "./mp4/muxer.js";
 
 /**
  * Ce navigateur peut-il lire du MKV via cinemux ?

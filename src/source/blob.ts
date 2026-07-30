@@ -1,4 +1,4 @@
-import type { Source } from "./index";
+import type { Source } from "./index.js";
 
 /**
  * Source locale (`File` d'un `<input type=file>`, ou `Blob`).

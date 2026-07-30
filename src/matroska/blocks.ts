@@ -1,4 +1,4 @@
-import { EbmlReader } from "../ebml/reader";
+import { EbmlReader } from "../ebml/reader.js";
 
 /**
  * Décodage d'un SimpleBlock / Block Matroska.
