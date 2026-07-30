@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="fr">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>cinemux — lire du MKV dans le navigateur</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --fond: #1f1f1f;
+        --surface: #1c1c1e;
+        --bord: rgb(255 255 255 / 0.18);
+        --texte: rgb(255 255 255 / 0.92);
+        --doux: rgb(255 255 255 / 0.64);
+        --faible: rgb(255 255 255 / 0.4);
+        --accent: #0a84ff;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        padding: 40px 24px 64px;
+        background: var(--fond);
+        color: var(--texte);
+        font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Inter", system-ui, sans-serif;
+        -webkit-font-smoothing: antialiased;
+      }
+      main { max-width: 900px; margin: 0 auto; }
+      h1 { font-size: 26px; margin: 0 0 4px; letter-spacing: -0.02em; }
+      p.sous { color: var(--doux); margin: 0 0 28px; }
+      code { font-family: ui-monospace, SFMono-Regular, monospace; font-size: 0.92em; }
+
+      .zone {
+        border: 1px dashed var(--bord);
+        border-radius: 14px;
+        padding: 28px;
+        text-align: center;
+        color: var(--doux);
+        transition: border-color 0.2s, background 0.2s;
+      }
+      .zone.survol { border-color: var(--accent); background: rgb(10 132 255 / 0.08); }
+
+      video {
+        width: 100%;
+        margin-top: 20px;
+        background: #000;
+        border-radius: 12px;
+        display: none;
+      }
+      video.visible { display: block; }
+
+      table { width: 100%; border-collapse: collapse; margin-top: 24px; font-size: 13px; }
+      th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid rgb(255 255 255 / 0.08); }
+      th { color: var(--faible); font-weight: 500; width: 190px; }
+      .pastille { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 7px; }
+      .oui { background: #34d399; } .non { background: #f87171; } .peut { background: #fbbf24; }
+      #journal {
+        margin-top: 20px; padding: 14px; border-radius: 10px; background: var(--surface);
+        font-family: ui-monospace, monospace; font-size: 12px; color: var(--doux);
+        white-space: pre-wrap; max-height: 220px; overflow: auto;
+      }
+      .erreur { color: #f87171; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>cinemux</h1>
+      <p class="sous">
+        Remux Matroska → MP4 fragmenté, dans le navigateur. Sans WASM, sans transcodage.
+      </p>
+
+      <div class="zone" id="zone">
+        Dépose un fichier <code>.mkv</code> ici, ou
+        <label style="color: var(--accent); cursor: pointer">
+          choisis-en un<input type="file" id="fichier" accept=".mkv,.webm,video/*" hidden />
+        </label>
+      </div>
+
+      <video id="video" controls playsinline></video>
+
+      <table id="infos" hidden>
+        <tbody id="corps"></tbody>
+      </table>
+
+      <div id="journal"></div>
+    </main>
+
+    <script type="module">
+      import { Cinemux, SourceBlob, codecsDisponibles, navigateurCompatible } from "../dist/index.js";
+
+      const zone = document.getElementById("zone");
+      const video = document.getElementById("video");
+      const journal = document.getElementById("journal");
+      const infos = document.getElementById("infos");
+      const corps = document.getElementById("corps");
+
+      const noter = (texte, erreur = false) => {
+        const ligne = document.createElement("div");
+        if (erreur) ligne.className = "erreur";
+        ligne.textContent = texte;
+        journal.append(ligne);
+        journal.scrollTop = journal.scrollHeight;
+      };
+
+      const rang = (cle, valeur) => {
+        const tr = document.createElement("tr");
+        const th = document.createElement("th");
+        th.textContent = cle;
+        const td = document.createElement("td");
+        if (valeur instanceof Node) td.append(valeur);
+        else td.textContent = valeur;
+        tr.append(th, td);
+        corps.append(tr);
+      };
+
+      if (!navigateurCompatible()) {
+        noter("MediaSource indisponible : ce navigateur ne peut pas lire de MKV par remux.", true);
+      } else {
+        const dispo = codecsDisponibles();
+        noter("codecs décodables ici : " + Object.entries(dispo)
+          .map(([k, v]) => `${k}=${v ? "oui" : "non"}`).join("  "));
+      }
+
+      let lecteur = null;
+
+      async function ouvrir(fichier) {
+        lecteur?.detacher();
+        corps.replaceChildren();
+        journal.replaceChildren();
+        infos.hidden = true;
+
+        noter(`ouverture de ${fichier.name} (${(fichier.size / 1048576).toFixed(1)} Mo)`);
+        const t0 = performance.now();
+
+        try {
+          lecteur = await Cinemux.attacher(video, new SourceBlob(fichier), {
+            languePreferee: "fr",
+            onDiagnostic: (d) => {
+              const ms = Math.round(performance.now() - t0);
+              noter(`pistes reconnues en ${ms} ms — ${d.mime}`);
+
+              infos.hidden = false;
+              rang("Type MIME", d.mime);
+              rang("Durée", d.dureeMs ? `${(d.dureeMs / 1000).toFixed(1)} s` : "inconnue");
+              for (const [nom, choix] of [["Vidéo", d.video], ["Audio", d.audio]]) {
+                if (!choix) { rang(nom, "aucune"); continue; }
+                const span = document.createElement("span");
+                const p = document.createElement("span");
+                p.className = "pastille " + (choix.supportee ? "oui" : "non");
+                span.append(p, document.createTextNode(
+                  `${choix.piste.codecId} → ${choix.description.codec}` +
+                  (choix.piste.langue !== "und" ? ` · ${choix.piste.langue}` : "") +
+                  (choix.supportee ? "" : " · non décodable ici"),
+                ));
+                rang(nom, span);
+              }
+              if (d.ecartees.length) {
+                rang("Pistes écartées", d.ecartees
+                  .map((e) => `${e.piste.codecId} (${e.raison})`).join(" · "));
+              }
+            },
+            onErreur: (e) => noter("erreur : " + e.message, true),
+          });
+
+          video.classList.add("visible");
+          rang("Seek", lecteur.seekPossible ? "index Cues trouvé" : "sans index (lecture linéaire)");
+
+          video.addEventListener("loadeddata", () => {
+            noter(`première image affichée en ${Math.round(performance.now() - t0)} ms`);
+          }, { once: true });
+          video.addEventListener("error", () => {
+            noter("le <video> a rejeté le flux : " + (video.error?.message ?? "?"), true);
+          });
+        } catch (e) {
+          noter("échec : " + e.message, true);
+        }
+      }
+
+      document.getElementById("fichier").addEventListener("change", (e) => {
+        if (e.target.files?.[0]) ouvrir(e.target.files[0]);
+      });
+      zone.addEventListener("dragover", (e) => {
+        e.preventDefault();
+        zone.classList.add("survol");
+      });
+      zone.addEventListener("dragleave", () => zone.classList.remove("survol"));
+      zone.addEventListener("drop", (e) => {
+        e.preventDefault();
+        zone.classList.remove("survol");
+        if (e.dataTransfer.files?.[0]) ouvrir(e.dataTransfer.files[0]);
+      });
+
+      // Permet à un test automatisé de charger un fichier par URL.
+      const params = new URLSearchParams(location.search);
+      const url = params.get("url");
+      if (url) {
+        const { SourceHttp } = await import("../dist/index.js");
+        lecteur?.detacher();
+        noter(`ouverture par URL : ${url}`);
+        const t0 = performance.now();
+        try {
+          lecteur = await Cinemux.attacher(video, new SourceHttp(url), {
+            languePreferee: "fr",
+            onDiagnostic: (d) => {
+              window.__diag = d;
+              noter(`pistes reconnues en ${Math.round(performance.now() - t0)} ms — ${d.mime}`);
+              infos.hidden = false;
+              rang("Type MIME", d.mime);
+              rang("Vidéo", d.video ? `${d.video.piste.codecId} → ${d.video.description.codec}` : "aucune");
+              rang("Audio", d.audio ? `${d.audio.piste.codecId} → ${d.audio.description.codec}` : "aucune");
+            },
+            onErreur: (e) => { window.__erreur = e.message; noter("erreur : " + e.message, true); },
+          });
+          video.classList.add("visible");
+          window.__pret = true;
+        } catch (e) {
+          window.__erreur = e.message;
+          noter("échec : " + e.message, true);
+        }
+      }
+    </script>
+  </body>
+</html>
