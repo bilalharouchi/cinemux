@@ -498,7 +498,14 @@ function FASTGAIN_SUR(code: number): number {
  * Ce qui est JUSTE, vérifié contre ffprobe : syncinfo et BSI (fréquence, acmod,
  * LFE, taille de trame), sur du stéréo comme du 5.1.
  *
- * Ce qui ne l'est pas : l'allocation de bits sur-alloue massivement. Un bloc
+ * Ce qui ne l'est pas : la lecture des blocs. MESURE CLÉ — en désactivant
+ * complètement les mantisses, une trame stéréo consomme déjà 107 % de son
+ * budget : le défaut est donc dans les ENTÊTES ou les EXPOSANTS, pas dans
+ * l'allocation comme je l'ai d'abord cru. Sur une trame isolée le coût tombe
+ * à 65 %, et un bloc sans exposants coûte 25 bits — cohérent ; c'est la
+ * variance d'un bloc à l'autre qui trahit la mauvaise lecture.
+ *
+ * (ancienne piste, invalidée) L'allocation sur-alloue. Un bloc
  * consomme 1176 à 3612 bits là où le budget en prévoit ~1011. Les `bap` obtenus
  * tournent autour de 7-15 (6 à 16 bits par mantisse) alors qu'un flux 192 kb/s
  * stéréo impose une moyenne de ~2 bits.
