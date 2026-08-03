@@ -164,6 +164,8 @@ function nbGroupesCouplage(strategie: number, nbBins: number): number {
 
 export type ResultatTrame = {
   entete: EnteteTrame;
+  /** Position du lecteur à la fin de chaque bloc — sert au diagnostic. */
+  positionsBlocs: number[];
   /** Position du lecteur en fin d'analyse, en bits depuis le début de la trame. */
   bitsConsommes: number;
   /** Nombre total de mantisses lues, tous canaux et tous blocs confondus. */
@@ -184,6 +186,7 @@ export function analyserTrame(data: Uint8Array): ResultatTrame | null {
   const { acmod, lfeon, fscod } = entete;
   const nch = entete.canaux;
   let mantissesLues = 0;
+  const positionsBlocs: number[] = [];
 
   // État persistant entre blocs — l'AC-3 réutilise beaucoup d'un bloc à l'autre.
   let cplinu = false;
@@ -195,6 +198,27 @@ export function analyserTrame(data: Uint8Array): ResultatTrame | null {
   const cplbndstrc = new Array<number>(18).fill(0);
   let params: ParamsAllocation = { ...PARAMS_DEFAUT };
   let phsflginu = false;
+
+  /**
+   * ÉTAT PERSISTANT ENTRE BLOCS — c'est tout l'esprit de l'AC-3 : un bloc qui ne
+   * transmet pas un paramètre réutilise celui du précédent. `snroffste = 0` ne
+   * veut pas dire « décalage nul », mais « le même qu'avant ».
+   *
+   * Les remettre à zéro à chaque bloc donnait une allocation fausse dès le bloc 1
+   * (le bloc 0 restant juste, ce qui rendait le bug difficile à voir) : mesuré à
+   * 4422 bits consommés là où on en attendait ~1011.
+   */
+  let csnroffst = 0;
+  const fsnroffst = new Array<number>(nch).fill(0);
+  const fgaincod = new Array<number>(nch).fill(0);
+  let cplfsnroffst = 0;
+  let cplfgaincod = 0;
+  let lfefsnroffst = 0;
+  let lfefgaincod = 0;
+  let cplfleak = 0;
+  let cplsleak = 0;
+  const deltba: (Int8Array | undefined)[] = new Array(nch).fill(undefined);
+  let deltbaCouplage: Int8Array | undefined;
 
   const chbwcod = new Array<number>(nch).fill(0);
   const endmant = new Array<number>(nch).fill(0);
@@ -301,14 +325,6 @@ export function analyserTrame(data: Uint8Array): ResultatTrame | null {
       };
     }
 
-    let csnroffst = 0;
-    const fsnroffst = new Array<number>(nch).fill(0);
-    const fgaincod = new Array<number>(nch).fill(0);
-    let cplfsnroffst = 0;
-    let cplfgaincod = 0;
-    let lfefsnroffst = 0;
-    let lfefgaincod = 0;
-
     if (r.drapeau()) {
       csnroffst = r.lire(6);
       if (cplinu) {
@@ -325,20 +341,23 @@ export function analyserTrame(data: Uint8Array): ResultatTrame | null {
       }
     }
 
-    let cplfleak = 0;
-    let cplsleak = 0;
     if (cplinu && r.drapeau()) {
       cplfleak = r.lire(3);
       cplsleak = r.lire(3);
     }
 
     // --- Ajustements delta de l'allocation ---
-    const deltba: (Int8Array | undefined)[] = new Array(nch).fill(undefined);
-    let deltbaCouplage: Int8Array | undefined;
+    // ORDRE CRUCIAL (§5.3.3) : la norme lit d'abord TOUS les codes `deltbae`
+    // (couplage puis chaque canal), et SEULEMENT ENSUITE les segments de chacun.
+    // Les entrelacer — lire le code d'un canal puis ses segments — désynchronise
+    // le flux dès qu'un seul canal porte des ajustements.
     if (r.drapeau()) {
-      const lireDelta = (): Int8Array | undefined => {
-        const mode = r.lire(2);
-        if (mode !== 1) return undefined; // 0 = réutilise, 2 = par défaut, 3 = réservé
+      const cpldeltbae = cplinu ? r.lire(2) : 2;
+      const deltbae = new Array<number>(nch);
+      for (let ch = 0; ch < nch; ch++) deltbae[ch] = r.lire(2);
+
+      /** Lit les segments d'un canal. `deltbae == 1` = nouvelles données. */
+      const lireSegments = (): Int8Array => {
         const nseg = r.lire(3) + 1;
         const table = new Int8Array(50);
         let bnd = 0;
@@ -346,13 +365,21 @@ export function analyserTrame(data: Uint8Array): ResultatTrame | null {
           bnd += r.lire(5); // offset
           const longueur = r.lire(4);
           const valeur = r.lire(3);
-          const applique = valeur >= 4 ? valeur - 4 : valeur + 4 - 8;
+          // Les valeurs 0..3 sont positives, 4..7 négatives (−4..−1).
+          const applique = valeur >= 4 ? valeur - 8 : valeur;
           for (let k = 0; k < longueur && bnd < 50; k++) table[bnd++] = applique;
         }
         return table;
       };
-      if (cplinu) deltbaCouplage = lireDelta();
-      for (let ch = 0; ch < nch; ch++) deltba[ch] = lireDelta();
+
+      if (cplinu) {
+        if (cpldeltbae === 1) deltbaCouplage = lireSegments();
+        else if (cpldeltbae === 2) deltbaCouplage = undefined; // « aucun delta »
+      }
+      for (let ch = 0; ch < nch; ch++) {
+        if (deltbae[ch] === 1) deltba[ch] = lireSegments();
+        else if (deltbae[ch] === 2) deltba[ch] = undefined;
+      }
     }
 
     if (r.drapeau()) {
@@ -451,9 +478,10 @@ export function analyserTrame(data: Uint8Array): ResultatTrame | null {
       }
     }
     if (lfeon) consommer(bapLfe, 0, 7);
+    positionsBlocs.push(r.position);
   }
 
-  return { entete, bitsConsommes: r.position, mantisses: mantissesLues };
+  return { entete, bitsConsommes: r.position, mantisses: mantissesLues, positionsBlocs };
 }
 
 /** FASTGAIN indexé, avec garde-fou : le champ fait 3 bits, la table 8 entrées. */
@@ -465,22 +493,33 @@ function FASTGAIN_SUR(code: number): number {
 
 
 /**
- * ÉTAT — INACHEVÉ, NON CÂBLÉ.
+ * ÉTAT — INACHEVÉ, NON CÂBLÉ. Mesure du 03/08/2026.
  *
- * Ce module analyse correctement syncinfo et BSI (fréquence, acmod, LFE, taille
- * de trame : vérifiés exacts contre ffprobe), mais la lecture des blocs audio
- * n'est pas encore juste au bit près. Mesure au 30/07/2026, sur des flux produits
- * par ffmpeg :
+ * Ce qui est JUSTE, vérifié contre ffprobe : syncinfo et BSI (fréquence, acmod,
+ * LFE, taille de trame), sur du stéréo comme du 5.1.
  *
- *   stéréo 192 kb/s  : 0/32 trames alignées, débordement médian −982 bits
- *   5.1    448 kb/s  : 1/32 trames alignées, débordement médian −2653 bits
+ * Ce qui ne l'est pas : l'allocation de bits sur-alloue massivement. Un bloc
+ * consomme 1176 à 3612 bits là où le budget en prévoit ~1011. Les `bap` obtenus
+ * tournent autour de 7-15 (6 à 16 bits par mantisse) alors qu'un flux 192 kb/s
+ * stéréo impose une moyenne de ~2 bits.
  *
- * L'écart s'est réduit d'un facteur ~5 en transcrivant fidèlement `lowcomp` et le
- * comptage des groupes d'exposants ; il reste une erreur dans la SYNTAXE des blocs
- * (§5.4.2), reconstituée de mémoire et pas encore confrontée à la norme champ par
- * champ.
+ * Cinq bugs réels ont déjà été trouvés et corrigés en confrontant le code à la
+ * norme, chacun ayant déplacé la mesure :
+ *   1. mécanisme `lowcomp` de la courbe d'excitation, entièrement absent ;
+ *   2. comptage des groupes d'exposants (la norme tronque après un biais +3/+9,
+ *      là où j'arrondissais au supérieur) ;
+ *   3. `deltbae` : la norme lit TOUS les codes avant les segments, pas en
+ *      alternance ;
+ *   4. csnroffst/fsnroffst/fgaincod PERSISTENT entre blocs — les remettre à zéro
+ *      faussait tout dès le bloc 1 (le bloc 0 restant correct, ce qui masquait
+ *      le problème) ;
+ *   5. `floortab[7] = 0xf800` est un entier SIGNÉ (−2048), pas 63488.
  *
- * Rien de tout ceci n'est branché sur le lecteur : `Remuxer` continue d'exclure
- * proprement les pistes AC-3. Aucun risque de régression, et aucune promesse
- * d'audio tant que `scripts/verifier-ac3.mts` n'affiche pas 100 % d'alignement.
+ * La piste restante : la courbe de masquage sort trop basse d'environ 1500
+ * unités, donc `address = (psd − mask) >> 5` explose. C'est soit `bndpsd`, soit
+ * l'excitation, soit l'échelle de `snroffset`.
+ *
+ * Rien n'est branché : `Remuxer` exclut proprement les pistes AC-3, et le remux
+ * vidéo n'est pas concerné. Pas d'audio promis tant que
+ * `scripts/verifier-ac3.mts` n'affiche pas 100 % d'alignement.
  */

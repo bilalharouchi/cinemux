@@ -32,9 +32,16 @@ export const DBPBTAB = [
   0x0000, 0x0700, 0x0900, 0x0b00,
 ] as const;
 
-/** Table 7.10 — plancher de masquage. */
+/**
+ * Table 7.10 — plancher de masquage.
+ *
+ * ATTENTION AU SIGNE : la norme note la dernière valeur `0xf800`, mais ces
+ * champs sont des entiers SIGNÉS sur 16 bits — 0xf800 vaut donc −2048, pas
+ * 63488. Prise en non signé, elle écrasait toute la courbe de masquage et
+ * l'allocation ne lisait plus aucune mantisse.
+ */
 export const FLOORTAB = [
-  0x02f0, 0x02b0, 0x0270, 0x0230, 0x01f0, 0x0170, 0x00f0, 0xf800,
+  0x02f0, 0x02b0, 0x0270, 0x0230, 0x01f0, 0x0170, 0x00f0, -2048,
 ] as const;
 
 /** Table 7.11 — gain rapide, indexé par fgaincod. */
