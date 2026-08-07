@@ -1,136 +1,141 @@
 # cinemux
 
-Lecture de fichiers **MKV dans un navigateur**. Sans WASM, sans transcodage, sans
-worker, sans en-têtes COOP/COEP.
+Play **MKV files in a browser**. No WASM, no transcoding, no worker, no
+COOP/COEP headers.
 
-## L'idée
+## The idea
 
-Un navigateur refuse un `.mkv`. Pas parce qu'il ne sait pas décoder ce qu'il y a
-dedans — mais parce qu'il ne sait pas **ouvrir la boîte**.
+A browser refuses a `.mkv`. Not because it can't decode what's inside — but
+because it doesn't know how to **open the box**.
 
-Or un MKV et un MP4 emballent le plus souvent les mêmes flux élémentaires. Mieux :
-Matroska range déjà la configuration du décodeur au format MP4.
+Yet an MKV and an MP4 most often wrap the same elementary streams. Better
+still: Matroska already stores the decoder configuration in MP4's own
+format.
 
-| Codec | Ce que contient `CodecPrivate` | Boîte MP4 |
+| Codec | What `CodecPrivate` holds | MP4 box |
 |---|---|---|
-| H.264 | `AVCDecoderConfigurationRecord` | `avcC` — copie directe |
-| HEVC | `HEVCDecoderConfigurationRecord` | `hvcC` — copie directe |
-| AV1 | `AV1CodecConfigurationRecord` | `av1C` — copie directe |
-| AAC | `AudioSpecificConfig` | `esds` — à envelopper |
-| Opus | `OpusHead` (Ogg) | `dOps` — à convertir |
-| FLAC | métadonnées FLAC | `dfLa` — à envelopper |
+| H.264 | `AVCDecoderConfigurationRecord` | `avcC` — direct copy |
+| HEVC | `HEVCDecoderConfigurationRecord` | `hvcC` — direct copy |
+| AV1 | `AV1CodecConfigurationRecord` | `av1C` — direct copy |
+| AAC | `AudioSpecificConfig` | `esds` — needs wrapping |
+| Opus | `OpusHead` (Ogg) | `dOps` — needs converting |
+| FLAC | FLAC metadata | `dfLa` — needs wrapping |
 
-cinemux démultiplexe donc le Matroska et **remballe** les échantillons en MP4
-fragmenté, qu'il donne à `MediaSource`. Aucun octet de bitstream n'est réencodé :
-ce n'est pas du transcodage, c'est du reconditionnement. D'où un coût processeur
-négligeable et un paquet de quelques dizaines de Ko, là où un `ffmpeg.wasm` pèse
-25 Mo, exige `SharedArrayBuffer` et donc des en-têtes qui cassent le reste du site.
+So cinemux demuxes the Matroska and **repackages** the samples as fragmented
+MP4, which it hands to `MediaSource`. No bitstream byte is ever re-encoded:
+this isn't transcoding, it's repackaging. Hence a negligible CPU cost and a
+package weighing a few dozen KB, where an `ffmpeg.wasm` weighs 25 MB,
+requires `SharedArrayBuffer`, and therefore headers that break the rest of
+the site.
 
-Et comme on passe par un vrai `<video>`, on hérite gratuitement des contrôles
-natifs, du plein écran, de l'image dans l'image, du casting et des raccourcis.
+And since it goes through a real `<video>`, native controls, fullscreen,
+picture-in-picture, casting, and keyboard shortcuts all come for free.
 
 ## Usage
 
 ```ts
-import { Cinemux, SourceHttp } from "cinemux";
+import { Cinemux, HttpSource } from "cinemux";
 
-const lecteur = await Cinemux.attacher(
+const player = await Cinemux.attach(
   document.querySelector("video")!,
-  new SourceHttp("/film.mkv"),
-  { languePreferee: "fr" },
+  new HttpSource("/movie.mkv"),
+  { preferredLanguage: "fr" },
 );
 
-console.log(lecteur.diagnostic);
+console.log(player.diagnostic);
 // { mime: 'video/mp4; codecs="avc1.640028,mp4a.40.2"',
-//   video: { … supportee: true }, audio: { … }, ecartees: [], dureeMs: 7_320_000 }
+//   video: { … supported: true }, audio: { … }, discarded: [], durationMs: 7_320_000 }
 ```
 
-Fichier local, sans serveur :
+Local file, no server:
 
 ```ts
-import { Cinemux, SourceBlob } from "cinemux";
-await Cinemux.attacher(video, new SourceBlob(input.files[0]));
+import { Cinemux, BlobSource } from "cinemux";
+await Cinemux.attach(video, new BlobSource(input.files[0]));
 ```
 
-Savoir avant d'ouvrir quoi que ce soit :
+Knowing before opening anything:
 
 ```ts
-import { navigateurCompatible, codecsDisponibles } from "cinemux";
-navigateurCompatible();  // false sans MediaSource (Safari iPhone)
-codecsDisponibles();     // { h264: true, hevc: false, aac: true, ac3: false, … }
+import { browserCompatible, availableCodecs } from "cinemux";
+browserCompatible();  // false without MediaSource (Safari on iPhone)
+availableCodecs();    // { h264: true, hevc: false, aac: true, ac3: false, … }
 ```
 
-## Ce qui marche
+## What works
 
-**Vidéo** — H.264 (Baseline → High, images B comprises), HEVC, AV1.
-**Audio** — AAC, Opus, FLAC, MP3, et AC-3 là où le navigateur le décode (Safari).
+**Video** — H.264 (Baseline → High, B-frames included), HEVC, AV1.
+**Audio** — AAC, Opus, FLAC, MP3, and AC-3 wherever the browser decodes it (Safari).
 
-**Seek sans télécharger le film.** L'index `Cues` d'un MKV vit à la fin du fichier,
-mais le `SeekHead` du début dit où le trouver : deux requêtes `Range` suffisent à
-récupérer l'index d'un film de 3 Go. Le seek fait ensuite une recherche binaire
-dans les Cues et repart au Cluster voulu.
+**Seeking without downloading the whole movie.** A MKV's `Cues` index lives
+at the end of the file, but the `SeekHead` at the start says where to find
+it: two `Range` requests are enough to fetch the index of a 3 GB movie.
+Seeking then does a binary search through the Cues and resumes at the right
+Cluster.
 
-**Sélection de piste audio.** Sur un fichier multi-langue, cinemux préfère d'abord
-ce que le navigateur sait décoder, puis la langue demandée, puis le codec le mieux
-traité. Un AC-3 en français est inutile si rien ne le joue.
+**Audio track selection.** On a multi-language file, cinemux first prefers
+whatever the browser can decode, then the requested language, then the
+best-handled codec. A French AC-3 track is useless if nothing plays it.
 
-**Lecture progressive.** Le remuxeur travaille en flux : la première image
-s'affiche après quelques centaines de Ko. Le téléchargement s'interrompt dès que le
-tampon a assez d'avance, et la mémoire est rendue derrière la tête de lecture.
+**Progressive playback.** The remuxer works as a stream: the first frame
+shows up after a few hundred KB. Downloading pauses as soon as the buffer
+has enough of a lead, and memory is freed behind the playhead.
 
-## Ce qui ne marche pas, et pourquoi
+## What doesn't work, and why
 
-**AC-3, E-AC-3, DTS, TrueHD** ne sont décodés par aucun navigateur grand public —
-Chromium a retiré les codecs audio propriétaires. cinemux les **détecte, les décrit
-correctement** (`dac3` écrit depuis le bitstream, faute de `CodecPrivate` en
-Matroska) et le dit dans `diagnostic.audio.supportee`. Il ne fait pas semblant : à
-l'application de proposer une autre source, ou une autre piste du même fichier.
+**AC-3, E-AC-3, DTS, TrueHD** aren't decoded by any mainstream browser —
+Chromium dropped proprietary audio codecs. cinemux **detects them and
+describes them correctly** (`dac3` written from the bitstream, since
+Matroska has no `CodecPrivate` for it) and reports it in
+`diagnostic.audio.supported`. It doesn't fake it: it's up to the application
+to offer another source, or another track from the same file.
 
-Les lever demanderait un décodeur AC-3 en WASM produisant du PCM, puis un
-réencodage en Opus via `AudioEncoder` (WebCodecs) — faisable, mais c'est du
-transcodage, avec le poids et le coût processeur que ça implique. Hors périmètre
-pour l'instant ; l'interface est prête à l'accueillir.
+Lifting this would require a WASM AC-3 decoder producing PCM, then
+re-encoding to Opus via `AudioEncoder` (WebCodecs) — doable, but that's
+transcoding, with the weight and CPU cost that implies. Out of scope for
+now; the interface is ready to accommodate it.
 
-**VP8/VP9** ne sont pas remuxés : un MKV en VP9/Opus est déjà presque du WebM, que
-les navigateurs lisent nativement. Sers-le en `video/webm`.
+**VP8/VP9** aren't remuxed: an MKV with VP9/Opus is already almost WebM,
+which browsers play natively. Serve it as `video/webm`.
 
-**Safari sur iPhone** n'a pas `MediaSource` (hors « Managed Media Source »).
-`navigateurCompatible()` renvoie `false` — mieux vaut le savoir avant.
+**Safari on iPhone** doesn't have `MediaSource` (outside "Managed Media
+Source"). `browserCompatible()` returns `false` — better to know that ahead
+of time.
 
-**Sous-titres embarqués** (ASS/SSA, PGS) ne sont pas extraits. Les pistes de
-sous-titres du MKV sont ignorées.
+**Embedded subtitles** (ASS/SSA, PGS) aren't extracted. The MKV's subtitle
+tracks are ignored.
 
 ## Architecture
 
 ```
 src/
-  ebml/        lecteur de primitives EBML (vint, entiers, flottants) + IDs Matroska
-  matroska/    démultiplexeur en flux + décodage des blocs (les 3 lacings)
-  codecs/      CodecID Matroska → entrée d'échantillon MP4 + chaîne de codec MSE
-  mp4/         écriture de boîtes ISO BMFF, segments d'init et fragments
-  source/      sources d'octets : HTTP (Range) et Blob
-  remuxer.ts   assemble le tout : sélection de pistes, découpage en fragments
-  player.ts    MediaSource, contre-pression, seek par Cues, quota mémoire
+  ebml/        EBML primitive reader (vint, integers, floats) + Matroska IDs
+  matroska/    streaming demuxer + block decoding (the 3 lacing types)
+  codecs/      Matroska CodecID → MP4 sample entry + MSE codec string
+  mp4/         ISO BMFF box writing, init segments and fragments
+  source/      byte sources: HTTP (Range) and Blob
+  remuxer.ts   ties it together: track selection, fragment chunking
+  player.ts    MediaSource, backpressure, seek via Cues, memory quota
 ```
 
-## Les deux pièges qui coûtent des heures
+## Two traps that cost hours
 
-**Matroska ne stocke que des PTS.** MP4 exige des DTS plus un décalage de
-composition. Avec des images B les deux diffèrent : poser `DTS = PTS` fait afficher
-les images dans l'ordre de décodage — saccade permanente sur tout encodage moderne.
-La reconstruction s'appuie sur une propriété simple : sur un groupe d'images fermé,
-l'*ensemble* des PTS égale l'ensemble des DTS, seul l'ordre change. Les PTS triés,
-réattribués dans l'ordre de décodage, donnent des DTS croissants et exacts.
+**Matroska only stores PTS.** MP4 requires DTS plus a composition offset.
+With B-frames the two differ: setting `DTS = PTS` displays frames in decode
+order — a permanent stutter on any modern encoding. The reconstruction
+relies on a simple property: within a closed group of pictures, the *set* of
+PTS equals the set of DTS, only the order changes. Sorting the PTS and
+reassigning them in decode order yields exact, increasing DTS values.
 
-Conséquence : le premier DTS est antérieur au premier PTS, et `tfdt` est non signé.
-La seule issue est d'avancer toute la présentation du délai de réordonnancement —
-**et de l'appliquer à l'audio aussi**. Ne le mettre que sur la vidéo décale le son
-de 80 ms, un défaut de synchronisation labiale audible.
+Consequence: the first DTS comes before the first PTS, and `tfdt` is
+unsigned. The only way out is to advance the entire presentation by the
+reordering delay — **and to apply it to audio too**. Applying it only to
+video shifts the sound by 80 ms, an audible lip-sync bug.
 
-**L'`OpusHead` d'Ogg n'est pas l'`OpusSpecificBox` de MP4.** La version vaut 1 d'un
-côté et 0 de l'autre, et les entiers sont petit-boutistes en Ogg, gros-boutistes en
-MP4. Recopier l'un dans l'autre en retirant la signature produit un `unsupported
-OpusSpecificBox version`.
+**Ogg's `OpusHead` is not MP4's `OpusSpecificBox`.** The version is 1 on one
+side and 0 on the other, and the integers are little-endian in Ogg,
+big-endian in MP4. Copying one into the other while just stripping the
+signature produces an `unsupported OpusSpecificBox version`.
 
 ## Tests
 
@@ -138,22 +143,24 @@ OpusSpecificBox version`.
 npm test
 ```
 
-25 tests. Les fixtures sont produites par ffmpeg (voir `test/fixtures/README.md`) et
-la sortie est jugée par **ffprobe et ffmpeg**, pas par mes convictions : nombre de
-paquets identique à la source, décodage complet sans une erreur, ordre de
-présentation strictement croissant, pistes alignées à moins de 5 ms.
+25 tests. Fixtures are produced by ffmpeg (see `test/fixtures/README.md`)
+and the output is judged by **ffprobe and ffmpeg**, not by my own
+convictions: packet count matching the source, error-free decoding
+throughout, strictly increasing presentation order, tracks aligned within
+less than 5 ms.
 
-## Démo
+## Demo
 
 ```bash
 npm run build
 npx http-server -p 8899 .
-# puis http://localhost:8899/demo/index.html
+# then http://localhost:8899/demo/index.html
 ```
 
-Dépose un `.mkv` dans la page. Le tableau affiche les pistes retenues, leur chaîne
-de codec, et une pastille verte ou rouge selon que ton navigateur sait les décoder.
+Drop an `.mkv` onto the page. The table shows the chosen tracks, their codec
+string, and a green or red dot depending on whether your browser can decode
+them.
 
-## Licence
+## License
 
 MIT.

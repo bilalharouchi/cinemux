@@ -1,55 +1,55 @@
 /**
- * Tables normatives du décodeur AC-3.
+ * Normative tables for the AC-3 decoder.
  *
- * PROVENANCE — extraites automatiquement de la norme publique **ATSC A/52:2018**
- * (« Digital Audio Compression (AC-3, E-AC-3) »), tables 7.6 à 7.16. Elles n'ont
- * pas été recopiées à la main : un script les lit dans le PDF et vérifie des
- * invariants (`sum(bndsz) === 253`, `baptab` croissante, bornes de `latab`…).
+ * PROVENANCE — extracted automatically from the public standard **ATSC A/52:2018**
+ * ("Digital Audio Compression (AC-3, E-AC-3)"), tables 7.6 to 7.16. They were
+ * not copied by hand: a script reads them from the PDF and checks invariants
+ * (`sum(bndsz) === 253`, `baptab` increasing, `latab` bounds…).
  *
- * POURQUOI CETTE PRÉCAUTION — ces constantes ne tolèrent AUCUNE erreur. Une seule
- * valeur fausse dans `hth` ou `baptab` change le nombre de bits alloués à une
- * bande, le lecteur de bits se décale, et tout le reste de la trame devient du
- * bruit. Ce n'est pas une dégradation progressive : c'est binaire.
+ * WHY THIS CAUTION — these constants tolerate NO error. A single wrong
+ * value in `hth` or `baptab` changes the number of bits allocated to a
+ * band, the bit reader drifts, and everything else in the frame becomes
+ * noise. This is not a gradual degradation: it is binary.
  */
 
-/** Table 7.6 — décroissance lente de la courbe de masquage. */
+/** Table 7.6 — slow decay of the masking curve. */
 export const SLOWDEC = [
   0x000f, 0x0011, 0x0013, 0x0015,
 ] as const;
 
-/** Table 7.7 — décroissance rapide. */
+/** Table 7.7 — fast decay. */
 export const FASTDEC = [
   0x003f, 0x0053, 0x0067, 0x007b,
 ] as const;
 
-/** Table 7.8 — gain lent. */
+/** Table 7.8 — slow gain. */
 export const SLOWGAIN = [
   0x0540, 0x04d8, 0x0478, 0x0410,
 ] as const;
 
-/** Table 7.9 — dB par bit. */
+/** Table 7.9 — dB per bit. */
 export const DBPBTAB = [
   0x0000, 0x0700, 0x0900, 0x0b00,
 ] as const;
 
 /**
- * Table 7.10 — plancher de masquage.
+ * Table 7.10 — masking floor.
  *
- * ATTENTION AU SIGNE : la norme note la dernière valeur `0xf800`, mais ces
- * champs sont des entiers SIGNÉS sur 16 bits — 0xf800 vaut donc −2048, pas
- * 63488. Prise en non signé, elle écrasait toute la courbe de masquage et
- * l'allocation ne lisait plus aucune mantisse.
+ * WATCH THE SIGN: the standard notes the last value as `0xf800`, but these
+ * fields are SIGNED 16-bit integers — 0xf800 is therefore −2048, not
+ * 63488. Taken as unsigned, it wiped out the whole masking curve and the
+ * allocation stopped reading any mantissa.
  */
 export const FLOORTAB = [
   0x02f0, 0x02b0, 0x0270, 0x0230, 0x01f0, 0x0170, 0x00f0, -2048,
 ] as const;
 
-/** Table 7.11 — gain rapide, indexé par fgaincod. */
+/** Table 7.11 — fast gain, indexed by fgaincod. */
 export const FASTGAIN = [
   0x0080, 0x0100, 0x0180, 0x0200, 0x0280, 0x0300, 0x0380, 0x0400,
 ] as const;
 
-/** Table 7.12 — premier bin de chaque bande de masquage (50 bandes). */
+/** Table 7.12 — first bin of each masking band (50 bands). */
 export const BNDTAB = [
   0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
   16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 31, 34, 37,
@@ -57,7 +57,7 @@ export const BNDTAB = [
   205, 229,
 ] as const;
 
-/** Table 7.12 — largeur de chaque bande, en bins. La somme vaut 253. */
+/** Table 7.12 — width of each band, in bins. The sum equals 253. */
 export const BNDSZ = [
   1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
   1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 3, 3, 3, 3,
@@ -65,7 +65,7 @@ export const BNDSZ = [
   24, 24,
 ] as const;
 
-/** Table 7.14 — addition logarithmique, indexée par (10·A + B). */
+/** Table 7.14 — logarithmic addition, indexed by (10·A + B). */
 export const LATAB = [
   0x0040, 0x003f, 0x003e, 0x003d, 0x003c, 0x003b, 0x003a, 0x0039, 0x0038, 0x0037,
   0x0036, 0x0035, 0x0034, 0x0034, 0x0033, 0x0032, 0x0031, 0x0030, 0x002f, 0x002f,
@@ -96,9 +96,9 @@ export const LATAB = [
 ] as const;
 
 /**
- * Table 7.15 — seuil d'audition par bande, pour chaque fréquence
- * d'échantillonnage (48 / 44,1 / 32 kHz). C'est la donnée psychoacoustique qui
- * fonde toute l'allocation de bits.
+ * Table 7.15 — hearing threshold per band, for each sampling frequency
+ * (48 / 44.1 / 32 kHz). This is the psychoacoustic data underlying the
+ * whole bit allocation.
  */
 export const HTH = [
   // 48 kHz
@@ -109,7 +109,7 @@ export const HTH = [
     0x02f0, 0x02f0, 0x02f0, 0x02f0, 0x0300, 0x0310, 0x0340, 0x0390, 0x03e0, 0x0420,
     0x0460, 0x0490, 0x04a0, 0x0460, 0x0440, 0x0440, 0x0520, 0x0800, 0x0840, 0x0840,
   ],
-  // 44,1 kHz
+  // 44.1 kHz
   [
     0x04f0, 0x04f0, 0x0460, 0x0410, 0x03e0, 0x03d0, 0x03c0, 0x03b0, 0x03b0, 0x03a0,
     0x03a0, 0x03a0, 0x03a0, 0x03a0, 0x0390, 0x0390, 0x0390, 0x0380, 0x0380, 0x0380,
@@ -127,7 +127,7 @@ export const HTH = [
   ],
 ] as const;
 
-/** Table 7.16 — adresse d'allocation → nombre de bits de mantisse (bap). */
+/** Table 7.16 — allocation address → number of mantissa bits (bap). */
 export const BAPTAB = [
   0, 1, 1, 1, 1, 1, 2, 2, 3, 3, 3, 4, 4, 5, 5, 6,
   6, 6, 6, 7, 7, 7, 7, 8, 8, 8, 8, 9, 9, 9, 9, 10,
@@ -136,16 +136,37 @@ export const BAPTAB = [
 ] as const;
 
 /**
- * Débits nominaux, indexés par `frmsizecod >> 1` (Table 5.18).
- * La taille de trame s'en déduit — sauf à 44,1 kHz où la spec impose un
- * arrondi et un mot de bourrage, traité dans le décodeur.
+ * Nominal bitrates, indexed by `frmsizecod >> 1` (Table 5.18).
+ * The frame size is derived from it — except at 44.1 kHz where the spec
+ * requires rounding and a padding word, handled in the decoder.
  */
-export const DEBITS_KBPS = [
+export const BITRATES_KBPS = [
   32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 448, 512, 576, 640,
 ] as const;
 
-/** Fréquences d'échantillonnage, indexées par fscod. */
-export const FREQUENCES = [48000, 44100, 32000] as const;
+/**
+ * Table 5.18 — frame size in 16-bit words at 44.1 kHz, PER BITRATE,
+ * `[even frmsizecod, odd frmsizecod]`. At this frequency, 1536 samples
+ * ÷ 44100 Hz never lands on an integer bit count: the standard compensates
+ * by alternating two sizes one word apart, chosen by the parity of
+ * `frmsizecod` (the padding word). 48 and 32 kHz don't have this problem
+ * (exact division), hence `2·kbps` / `3·kbps` directly in the code.
+ *
+ * PROVENANCE — not copied from a derived formula (which gave 6-7 words
+ * instead of ~418 for 192 kb/s, wildly out of spec): measured by generating
+ * the 19 bitrates with `ffmpeg -c:a ac3` at 44.1 kHz and counting the actual
+ * gap between consecutive syncwords. Cross-checked against the public ATSC
+ * A/52 table — same values.
+ */
+export const WORD_SIZE_44_1: readonly (readonly [number, number])[] = [
+  [69, 70], [87, 88], [104, 105], [121, 122], [139, 140], [174, 175],
+  [208, 209], [243, 244], [278, 279], [348, 349], [417, 418], [487, 488],
+  [557, 558], [696, 697], [835, 836], [975, 976], [1114, 1115], [1253, 1254],
+  [1393, 1394],
+] as const;
 
-/** Nombre de canaux à pleine bande, indexé par acmod (hors LFE). */
-export const CANAUX_ACMOD = [2, 1, 2, 3, 3, 4, 4, 5] as const;
+/** Sampling frequencies, indexed by fscod. */
+export const FREQUENCIES = [48000, 44100, 32000] as const;
+
+/** Number of full-bandwidth channels, indexed by acmod (excluding LFE). */
+export const CHANNELS_BY_ACMOD = [2, 1, 2, 3, 3, 4, 4, 5] as const;

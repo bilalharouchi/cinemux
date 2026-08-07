@@ -1,65 +1,70 @@
 /**
- * cinemux — lecture de fichiers MKV dans un navigateur.
+ * cinemux — playing MKV files in a browser.
  *
- * Principe : un MKV et un MP4 emballent souvent les MÊMES flux élémentaires
- * (H.264, HEVC, AV1, AAC, Opus…). Le navigateur ne sait pas ouvrir la boîte
- * Matroska, mais il sait décoder ce qu'elle contient. On remballe donc les
- * échantillons en MP4 fragmenté à la volée, et on les donne à MediaSource.
+ * Principle: an MKV and an MP4 often wrap the SAME elementary streams
+ * (H.264, HEVC, AV1, AAC, Opus…). The browser doesn't know how to open the
+ * Matroska box, but it knows how to decode what's inside it. So the samples
+ * are re-wrapped into fragmented MP4 on the fly, and handed to MediaSource.
  *
- * Aucun octet de bitstream n'est réencodé : ce n'est pas du transcodage, c'est
- * du reconditionnement. D'où l'absence de WASM, de worker et d'en-têtes
- * COOP/COEP — et un coût processeur négligeable.
+ * No bitstream byte is ever re-encoded: this isn't transcoding, it's
+ * repackaging. No WASM, no COOP/COEP headers — and negligible CPU cost, with
+ * ONE exception: when the audio track is AC-3 (which no browser decodes
+ * natively), it's decoded in pure JS, in a dedicated Worker
+ * (`ac3-worker.ts`, orchestrated by `audio-ac3.ts`) so it never blocks the
+ * main thread — see that file for why (measured: 95-98% of every main
+ * thread stall, before).
  *
  * ```ts
- * import { Cinemux, SourceHttp } from "cinemux";
+ * import { Cinemux, HttpSource } from "cinemux";
  *
- * const lecteur = await Cinemux.attacher(
+ * const player = await Cinemux.attach(
  *   document.querySelector("video")!,
- *   new SourceHttp("/film.mkv"),
- *   { languePreferee: "fr" },
+ *   new HttpSource("/movie.mkv"),
+ *   { preferredLanguage: "fr" },
  * );
- * console.log(lecteur.diagnostic);
+ * console.log(player.diagnostic);
  * ```
  */
 
-export { Cinemux, type OptionsLecture } from "./player.js";
-export { Remuxer, type Diagnostic, type PisteChoisie, type OptionsRemuxer } from "./remuxer.js";
-export { SourceHttp } from "./source/http.js";
-export { SourceBlob } from "./source/blob.js";
+export { Cinemux, type PlaybackOptions } from "./player.js";
+export { Remuxer, type Diagnostic, type ChosenTrack, type RemuxerOptions } from "./remuxer.js";
+export { HttpSource } from "./source/http.js";
+export { BlobSource } from "./source/blob.js";
 export type { Source } from "./source/index.js";
 
 export { MatroskaDemuxer } from "./matroska/demuxer.js";
-export type { Piste, Echantillon, PointCue } from "./matroska/demuxer.js";
+export type { Track, Sample, CuePoint } from "./matroska/demuxer.js";
 export { TrackType } from "./ebml/ids.js";
 
-export { decrire, analyserAc3, mimeDe, CodecNonSupporte, type Description } from "./codecs/index.js";
-export { segmentInit, segmentMedia, reconstruireDts } from "./mp4/muxer.js";
+export { describe, parseAc3Header, mimeFor, UnsupportedCodec, type Description } from "./codecs/index.js";
+export { segmentInit, mediaSegment, reconstructDts } from "./mp4/muxer.js";
 
 /**
- * Ce navigateur peut-il lire du MKV via cinemux ?
+ * Can this browser play MKV via cinemux?
  *
- * Répond non sans MediaSource (vieux navigateurs, et surtout Safari iPhone où MSE
- * n'existe pas hors mode « Managed Media Source »).
+ * Returns false without MediaSource (old browsers, and especially Safari on
+ * iPhone, where MSE doesn't exist outside "Managed Media Source" mode).
  */
-export function navigateurCompatible(): boolean {
+export function browserCompatible(): boolean {
   return typeof MediaSource !== "undefined" && typeof MediaSource.isTypeSupported === "function";
 }
 
 /**
- * Codecs réellement décodables ici, pour informer avant même d'ouvrir un fichier.
- * Utile pour choisir une source côté serveur plutôt que d'échouer devant l'utilisateur.
+ * Codecs actually decodable here, to inform the caller before even opening
+ * a file. Useful for choosing a source server-side instead of failing in
+ * front of the user.
  */
-export function codecsDisponibles(): Record<string, boolean> {
+export function availableCodecs(): Record<string, boolean> {
   if (typeof MediaSource === "undefined") return {};
-  const tester = (mime: string) => MediaSource.isTypeSupported(mime);
+  const test = (mime: string) => MediaSource.isTypeSupported(mime);
   return {
-    "h264": tester('video/mp4; codecs="avc1.640028"'),
-    "hevc": tester('video/mp4; codecs="hvc1.1.6.L93.B0"'),
-    "av1": tester('video/mp4; codecs="av01.0.08M.08"'),
-    "aac": tester('audio/mp4; codecs="mp4a.40.2"'),
-    "opus": tester('audio/mp4; codecs="opus"'),
-    "flac": tester('audio/mp4; codecs="flac"'),
-    "ac3": tester('audio/mp4; codecs="ac-3"'),
-    "eac3": tester('audio/mp4; codecs="ec-3"'),
+    "h264": test('video/mp4; codecs="avc1.640028"'),
+    "hevc": test('video/mp4; codecs="hvc1.1.6.L93.B0"'),
+    "av1": test('video/mp4; codecs="av01.0.08M.08"'),
+    "aac": test('audio/mp4; codecs="mp4a.40.2"'),
+    "opus": test('audio/mp4; codecs="opus"'),
+    "flac": test('audio/mp4; codecs="flac"'),
+    "ac3": test('audio/mp4; codecs="ac-3"'),
+    "eac3": test('audio/mp4; codecs="ec-3"'),
   };
 }

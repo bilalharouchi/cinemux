@@ -1,7 +1,7 @@
 {
   "name": "cinemux",
   "version": "0.1.0",
-  "description": "Lecture des fichiers MKV dans un navigateur, par remux Matroska → fMP4. Sans WASM, sans transcodage.",
+  "description": "Play MKV files in a browser by remuxing Matroska to fMP4. No WASM, no transcoding.",
   "type": "module",
   "license": "MIT",
   "main": "./dist/index.js",

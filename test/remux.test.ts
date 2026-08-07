@@ -6,181 +6,218 @@ import { join } from "node:path";
 import { Remuxer, type Diagnostic } from "../src/remuxer.js";
 
 /**
- * Ces tests jugent la sortie avec ffprobe, pas avec mes propres convictions.
- * Un fMP4 « qui a l'air bon » et qu'aucun démultiplexeur ne relit n'a aucune valeur.
+ * These tests judge the output with ffprobe, not with our own convictions.
+ * An fMP4 that "looks right" and that no demuxer can read back has no value.
  */
 
-function lireFixture(nom: string): Uint8Array {
-  return new Uint8Array(readFileSync(new URL(`./fixtures/${nom}`, import.meta.url)));
+function readFixture(name: string): Uint8Array {
+  return new Uint8Array(readFileSync(new URL(`./fixtures/${name}`, import.meta.url)));
 }
 
-/** Codecs que le faux navigateur des tests accepte : le cas Chrome. */
-function faussSupport(mime: string): boolean {
+/** Codecs the tests' fake browser accepts: the Chrome case. */
+function fakeSupport(mime: string): boolean {
   return !/ac-3|ec-3|dts/.test(mime);
 }
 
-type Resultat = { fichier: string; diag: Diagnostic; segments: number; octets: number };
+type Result = { file: string; diag: Diagnostic; segments: number; bytes: number };
 
-function remuxer(nom: string, options: { support?: (m: string) => boolean; langue?: string } = {}): Resultat {
-  const morceaux: Uint8Array[] = [];
+function remux(name: string, options: { support?: (m: string) => boolean; language?: string } = {}): Result {
+  const chunks: Uint8Array[] = [];
   let diag: Diagnostic | null = null;
   let segments = 0;
 
   const r = new Remuxer({
-    supporte: options.support ?? faussSupport,
-    languePreferee: options.langue,
+    isSupported: options.support ?? fakeSupport,
+    preferredLanguage: options.language,
     onInit: (seg, d) => {
       diag = d;
-      morceaux.push(seg);
+      chunks.push(seg);
     },
     onSegment: (seg) => {
       segments++;
-      morceaux.push(seg);
+      chunks.push(seg);
     },
-    onErreur: (e) => {
+    onError: (e) => {
       throw e;
     },
   });
 
-  // Alimenté par morceaux de 64 Ko, comme le ferait une requête HTTP en flux.
-  const octets = lireFixture(nom);
-  for (let i = 0; i < octets.length; i += 65536) {
-    r.alimenter(octets.subarray(i, Math.min(i + 65536, octets.length)));
+  // Fed in 64 KB chunks, like a streamed HTTP request would.
+  const bytes = readFixture(name);
+  for (let i = 0; i < bytes.length; i += 65536) {
+    r.feed(bytes.subarray(i, Math.min(i + 65536, bytes.length)));
   }
-  r.terminer();
+  r.finish();
 
-  const total = morceaux.reduce((n, m) => n + m.length, 0);
-  const sortie = new Uint8Array(total);
+  const total = chunks.reduce((n, m) => n + m.length, 0);
+  const output = new Uint8Array(total);
   let pos = 0;
-  for (const m of morceaux) {
-    sortie.set(m, pos);
+  for (const m of chunks) {
+    output.set(m, pos);
     pos += m.length;
   }
 
-  const fichier = join(mkdtempSync(join(tmpdir(), "cinemux-")), nom.replace(/\.mkv$/, ".mp4"));
-  writeFileSync(fichier, sortie);
-  return { fichier, diag: diag!, segments, octets: total };
+  const file = join(mkdtempSync(join(tmpdir(), "cinemux-")), name.replace(/\.mkv$/, ".mp4"));
+  writeFileSync(file, output);
+  return { file, diag: diag!, segments, bytes: total };
 }
 
-function ffprobe(fichier: string, ...args: string[]): string {
-  return execFileSync("ffprobe", ["-v", "error", ...args, fichier], { encoding: "utf8" }).trim();
+function ffprobe(file: string, ...args: string[]): string {
+  return execFileSync("ffprobe", ["-v", "error", ...args, file], { encoding: "utf8" }).trim();
 }
 
-describe("remux MKV → fMP4", () => {
-  it("produit un MP4 que ffprobe relit, avec les deux pistes", () => {
-    const { fichier, diag } = remuxer("h264-aac.mkv");
+describe("MKV → fMP4 remux", () => {
+  it("produces an MP4 that ffprobe reads back, with both tracks", () => {
+    const { file, diag } = remux("h264-aac.mkv");
 
-    expect(diag.video?.piste.codecId).toBe("V_MPEG4/ISO/AVC");
-    expect(diag.audio?.piste.codecId).toBe("A_AAC");
-    // La chaîne est DÉRIVÉE de l'avcC, jamais devinée : x264 en `ultrafast`
-    // produit du Constrained Baseline niveau 1.2, soit 42c00c.
-    const avcC = diag.video!.piste.codecPrivate!;
-    const attendu = [avcC[1], avcC[2], avcC[3]]
+    expect(diag.video?.track.codecId).toBe("V_MPEG4/ISO/AVC");
+    expect(diag.audio?.track.codecId).toBe("A_AAC");
+    // The codec string is DERIVED from the avcC, never guessed: x264 in
+    // `ultrafast` produces Constrained Baseline level 1.2, i.e. 42c00c.
+    const avcC = diag.video!.track.codecPrivate!;
+    const expected = [avcC[1], avcC[2], avcC[3]]
       .map((o) => o.toString(16).padStart(2, "0"))
       .join("");
-    expect(diag.mime).toBe(`video/mp4; codecs="avc1.${attendu},mp4a.40.2"`);
+    expect(diag.mime).toBe(`video/mp4; codecs="avc1.${expected},mp4a.40.2"`);
     expect(diag.mime).toMatch(/^video\/mp4; codecs="avc1\.[0-9a-f]{6},mp4a\.40\.2"$/);
 
-    const flux = ffprobe(fichier, "-show_entries", "stream=codec_name,codec_type,width,height", "-of", "csv=p=0");
-    expect(flux).toContain("h264,video,320,180");
-    expect(flux).toContain("aac,audio");
+    const stream = ffprobe(file, "-show_entries", "stream=codec_name,codec_type,width,height", "-of", "csv=p=0");
+    expect(stream).toContain("h264,video,320,180");
+    expect(stream).toContain("aac,audio");
   });
 
-  it("le conteneur est bien du MP4 fragmenté", () => {
-    const { fichier } = remuxer("h264-aac.mkv");
-    const format = ffprobe(fichier, "-show_entries", "format=format_name", "-of", "csv=p=0");
+  it("the container is indeed fragmented MP4", () => {
+    const { file } = remux("h264-aac.mkv");
+    const format = ffprobe(file, "-show_entries", "format=format_name", "-of", "csv=p=0");
     expect(format).toMatch(/mp4/);
-    // Un fragmenté n'a pas de table d'échantillons : ffprobe le lit via les moof.
-    const octets = readFileSync(fichier);
-    expect(octets.includes(Buffer.from("moof"))).toBe(true);
-    expect(octets.includes(Buffer.from("mvex"))).toBe(true);
-    expect(octets.includes(Buffer.from("tfdt"))).toBe(true);
+    // A fragmented file has no sample table: ffprobe reads it via moof boxes.
+    const bytes = readFileSync(file);
+    expect(bytes.includes(Buffer.from("moof"))).toBe(true);
+    expect(bytes.includes(Buffer.from("mvex"))).toBe(true);
+    expect(bytes.includes(Buffer.from("tfdt"))).toBe(true);
   });
 
-  it("aucune trame n'est perdue ni inventée", () => {
-    const { fichier } = remuxer("h264-aac.mkv");
+  it("no frame is lost or invented", () => {
+    const { file } = remux("h264-aac.mkv");
     const source = new URL("./fixtures/h264-aac.mkv", import.meta.url).pathname;
 
-    const compter = (f: string, flux: string) =>
+    const count = (f: string, stream: string) =>
       Number(
         execFileSync(
           "ffprobe",
-          ["-v", "error", "-select_streams", flux, "-count_packets",
+          ["-v", "error", "-select_streams", stream, "-count_packets",
            "-show_entries", "stream=nb_read_packets", "-of", "csv=p=0", f],
           { encoding: "utf8" },
         ).trim(),
       );
 
-    expect(compter(fichier, "v:0")).toBe(compter(source, "v:0"));
-    expect(compter(fichier, "a:0")).toBe(compter(source, "a:0"));
+    expect(count(file, "v:0")).toBe(count(source, "v:0"));
+    expect(count(file, "a:0")).toBe(count(source, "a:0"));
   });
 
-  it("la vidéo se décode réellement, sans erreur", () => {
-    // Le seul test qui prouve que les octets sont au bon endroit : on décode tout.
-    const { fichier } = remuxer("h264-aac.mkv");
-    const sortie = execFileSync(
+  it("the video actually decodes, without error", () => {
+    // The only test that proves the bytes are in the right place: decode everything.
+    const { file } = remux("h264-aac.mkv");
+    const output = execFileSync(
       "ffmpeg",
-      ["-v", "error", "-i", fichier, "-f", "null", "-"],
+      ["-v", "error", "-i", file, "-f", "null", "-"],
       { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
     );
-    expect(sortie.trim()).toBe("");
+    expect(output.trim()).toBe("");
   });
 
-  it("la durée est préservée", () => {
-    const { fichier } = remuxer("h264-aac.mkv");
-    const duree = Number(ffprobe(fichier, "-show_entries", "format=duration", "-of", "csv=p=0"));
-    expect(duree).toBeGreaterThan(2.9);
-    expect(duree).toBeLessThan(3.2);
+  it("duration is preserved", () => {
+    const { file } = remux("h264-aac.mkv");
+    const duration = Number(ffprobe(file, "-show_entries", "format=duration", "-of", "csv=p=0"));
+    expect(duration).toBeGreaterThan(2.9);
+    expect(duration).toBeLessThan(3.2);
   });
 
-  it("préfère l'AAC à l'AC-3 quand les deux existent", () => {
-    // Cas réel d'une release MULTi : la piste AC-3 est souvent la première et
-    // marquée par défaut, mais aucun navigateur ne la décode.
-    const { diag } = remuxer("h264-multi-audio.mkv");
-    expect(diag.audio?.piste.codecId).toBe("A_AAC");
-    expect(diag.audio?.supportee).toBe(true);
+  it("prefers AAC over AC-3 when both exist", () => {
+    // A real MULTi release case: the AC-3 track is often first and marked
+    // as default, but no browser decodes it.
+    const { diag } = remux("h264-multi-audio.mkv");
+    expect(diag.audio?.track.codecId).toBe("A_AAC");
+    expect(diag.audio?.supported).toBe(true);
   });
 
-  it("garde l'AC-3 quand le navigateur le décode (Safari)", () => {
-    const { diag } = remuxer("h264-multi-audio.mkv", { support: () => true });
-    // Tout est supporté : c'est alors le rang de codec qui tranche, AAC en tête.
-    expect(diag.audio?.supportee).toBe(true);
+  it("keeps AC-3 when the browser decodes it (Safari)", () => {
+    const { diag } = remux("h264-multi-audio.mkv", { support: () => true });
+    // Everything is supported: codec rank then decides, AAC first.
+    expect(diag.audio?.supported).toBe(true);
   });
 
-  it("un fichier AC-3 seul est décrit, et signalé comme non lisible", () => {
-    // On ne fait pas semblant : la piste est décrite (dac3 écrit depuis le flux),
-    // mais `supportee` dit la vérité au lecteur, qui pourra proposer autre chose.
-    const { diag } = remuxer("h264-ac3.mkv");
-    expect(diag.audio?.piste.codecId).toBe("A_AC3");
-    expect(diag.audio?.supportee).toBe(false);
-    expect(diag.video?.supportee).toBe(true);
+  it("an AC-3-only file is described, and flagged as unplayable", () => {
+    // We don't pretend: the track is described (dac3 written from the
+    // stream), but `supported` tells the player the truth so it can offer
+    // something else.
+    const { diag } = remux("h264-ac3.mkv");
+    expect(diag.audio?.track.codecId).toBe("A_AC3");
+    expect(diag.audio?.supported).toBe(false);
+    expect(diag.video?.supported).toBe(true);
   });
 
-  it("produit plusieurs fragments plutôt qu'un seul bloc", () => {
-    // Un seul fragment interdirait la lecture progressive : il faudrait tout
-    // télécharger avant la première image.
-    const { segments } = remuxer("h264-aac.mkv");
+  it("produces several fragments rather than a single block", () => {
+    // A single fragment would rule out progressive playback: everything
+    // would need to download before the first frame.
+    const { segments } = remux("h264-aac.mkv");
     expect(segments).toBeGreaterThan(2);
   });
 
-  it("l'audio AC-3 est analysé correctement depuis le flux", async () => {
-    const { analyserAc3 } = await import("../src/codecs/index.js");
-    // Première trame AC-3 de la fixture, extraite via le démultiplexeur.
-    const { MatroskaDemuxer } = await import("../src/matroska/demuxer.js");
-    let trame: Uint8Array | null = null;
-    const d = new MatroskaDemuxer({
-      onEchantillon: (e: { piste: number; donnees: Uint8Array }) => {
-        if (!trame && e.piste === 2) trame = e.donnees;
+  it("offers unmuxed AC-3 frames via onUnmuxedSample, instead of discarding them", () => {
+    // This is what `player.ts` uses to play sound through the Web Audio API
+    // when MediaSource can't (see audio-ac3.ts): without this callback,
+    // these frames simply vanished inside `store()`.
+    const received: { size: number; codecId: string }[] = [];
+    const r = new Remuxer({
+      isSupported: fakeSupport,
+      onError: (e) => {
+        throw e;
+      },
+      onUnmuxedSample: (e, track) => {
+        received.push({ size: e.data.length, codecId: track.codecId });
       },
     });
-    d.alimenter(lireFixture("h264-ac3.mkv"));
+    r.feed(readFixture("h264-ac3.mkv"));
+    r.finish();
 
-    const entete = analyserAc3(trame!);
-    expect(entete).not.toBeNull();
-    // ffprobe dit 44100 Hz / 1 canal sur cette fixture : notre lecture du
-    // bitstream doit tomber exactement dessus, sans CodecPrivate pour aider.
-    expect(entete!.frequence).toBe(44100);
-    expect([48000, 44100, 32000]).toContain(entete!.frequence);
-    expect(entete!.canaux).toBe(1);
+    expect(received.length).toBeGreaterThan(0);
+    expect(received.every((x) => x.codecId === "A_AC3")).toBe(true);
+    expect(received.every((x) => x.size > 0)).toBe(true);
+  });
+
+  it("does NOT call onUnmuxedSample when the AC-3 is actually playable (Safari)", () => {
+    const received: unknown[] = [];
+    const r = new Remuxer({
+      isSupported: () => true,
+      onError: (e) => {
+        throw e;
+      },
+      onUnmuxedSample: (e) => received.push(e),
+    });
+    r.feed(readFixture("h264-ac3.mkv"));
+    r.finish();
+    expect(received).toHaveLength(0);
+  });
+
+  it("AC-3 audio is correctly parsed from the stream", async () => {
+    const { parseAc3Header } = await import("../src/codecs/index.js");
+    // First AC-3 frame of the fixture, extracted via the demuxer.
+    const { MatroskaDemuxer } = await import("../src/matroska/demuxer.js");
+    let frame: Uint8Array | null = null;
+    const d = new MatroskaDemuxer({
+      onSample: (e: { track: number; data: Uint8Array }) => {
+        if (!frame && e.track === 2) frame = e.data;
+      },
+    });
+    d.feed(readFixture("h264-ac3.mkv"));
+
+    const header = parseAc3Header(frame!);
+    expect(header).not.toBeNull();
+    // ffprobe reports 44100 Hz / 1 channel on this fixture: our bitstream
+    // reading must land exactly on it, with no CodecPrivate to help.
+    expect(header!.frequency).toBe(44100);
+    expect([48000, 44100, 32000]).toContain(header!.frequency);
+    expect(header!.channels).toBe(1);
   });
 });

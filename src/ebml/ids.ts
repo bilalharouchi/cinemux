@@ -1,19 +1,18 @@
 /**
- * Identifiants d'éléments EBML/Matroska.
+ * EBML/Matroska element identifiers.
  *
- * Les IDs sont notés tels qu'ils apparaissent dans le fichier, en-tête de
- * longueur INCLUS — c'est ce que renvoie le lecteur, donc la comparaison est
- * directe. `0xA3` est bien la valeur brute du premier octet d'un SimpleBlock,
- * pas un identifiant « décodé ».
+ * IDs are recorded as they appear in the file, length header INCLUDED — this
+ * is what the reader returns, so the comparison is direct. `0xA3` is the raw
+ * value of a SimpleBlock's first byte, not a "decoded" identifier.
  *
- * Référence : matroska.org/technical/elements.html
+ * Reference: matroska.org/technical/elements.html
  */
 export const ID = {
-  // Niveau racine
+  // Root level
   EBML: 0x1a45dfa3,
   Segment: 0x18538067,
 
-  // Niveau 1
+  // Level 1
   SeekHead: 0x114d9b74,
   Info: 0x1549a966,
   Tracks: 0x1654ae6b,
@@ -85,7 +84,7 @@ export const ID = {
   CueRelativePosition: 0xf0,
 } as const;
 
-/** TrackType — valeurs Matroska. */
+/** TrackType — Matroska values. */
 export const TrackType = {
   VIDEO: 1,
   AUDIO: 2,
@@ -98,11 +97,11 @@ export const TrackType = {
 } as const;
 
 /**
- * Éléments « maîtres » dans lesquels il faut descendre.
+ * "Master" elements that must be descended into.
  *
- * Nécessaire parce qu'EBML ne dit pas dans l'octet lui-même si un élément est un
- * conteneur : c'est le schéma qui le sait. Sans cette liste, on lirait le contenu
- * de `Tracks` comme un bloc binaire opaque.
+ * Needed because EBML doesn't say in the byte itself whether an element is a
+ * container: only the schema knows. Without this list, `Tracks`'s content
+ * would be read as an opaque binary blob.
  */
 export const MASTER_ELEMENTS: ReadonlySet<number> = new Set<number>([
   ID.EBML,

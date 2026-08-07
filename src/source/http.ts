@@ -1,101 +1,102 @@
 import type { Source } from "./index.js";
 
 /**
- * Source HTTP avec requêtes partielles (`Range`).
+ * HTTP source with partial requests (`Range`).
  *
- * Le seek en dépend entièrement : sans `Accept-Ranges: bytes` côté serveur, on ne
- * peut que lire le fichier du début, et sauter à 1 h 30 de film voudrait dire
- * télécharger 1 h 30 de vidéo. La classe le vérifie et le dit franchement.
+ * Seeking depends on it entirely: without `Accept-Ranges: bytes` on the
+ * server side, the file can only be read from the start, and jumping to
+ * 1h30 into a movie would mean downloading 1h30 of video. The class checks
+ * for it and says so plainly.
  */
-export class SourceHttp implements Source {
-  private tailleConnue: number | null | undefined;
-  private plagesOk: boolean | undefined;
+export class HttpSource implements Source {
+  private knownSize: number | null | undefined;
+  private rangesOk: boolean | undefined;
 
   constructor(
     readonly url: string,
-    private readonly entetes: Record<string, string> = {},
+    private readonly headers: Record<string, string> = {},
   ) {}
 
   /**
-   * Sonde la source. On tente un HEAD, puis on se rabat sur un GET de 1 octet :
-   * beaucoup de serveurs (et les URL signées de CDN) refusent HEAD tout en
-   * gérant parfaitement les Range.
+   * Probes the source. A HEAD is tried first, falling back to a 1-byte GET:
+   * many servers (and CDN signed URLs) refuse HEAD while handling Range
+   * requests perfectly well.
    */
-  private async sonder(): Promise<void> {
-    if (this.tailleConnue !== undefined) return;
+  private async probe(): Promise<void> {
+    if (this.knownSize !== undefined) return;
 
-    const lireEntetes = (res: Response) => {
-      const longueur = res.headers.get("content-length");
-      const plage = res.headers.get("content-range");
-      this.plagesOk =
+    const readHeaders = (res: Response) => {
+      const length = res.headers.get("content-length");
+      const range = res.headers.get("content-range");
+      this.rangesOk =
         res.status === 206 || (res.headers.get("accept-ranges") ?? "").includes("bytes");
-      if (plage) {
-        // Content-Range: bytes 0-0/123456 → la taille est après la barre.
-        const total = plage.split("/")[1];
-        this.tailleConnue = total && total !== "*" ? Number(total) : null;
+      if (range) {
+        // Content-Range: bytes 0-0/123456 → the size is after the slash.
+        const total = range.split("/")[1];
+        this.knownSize = total && total !== "*" ? Number(total) : null;
       } else {
-        this.tailleConnue = longueur ? Number(longueur) : null;
+        this.knownSize = length ? Number(length) : null;
       }
     };
 
     try {
-      const head = await fetch(this.url, { method: "HEAD", headers: this.entetes });
+      const head = await fetch(this.url, { method: "HEAD", headers: this.headers });
       if (head.ok) {
-        lireEntetes(head);
-        if (this.tailleConnue) return;
+        readHeaders(head);
+        if (this.knownSize) return;
       }
     } catch {
-      // HEAD refusé : on continue en GET partiel.
+      // HEAD refused: fall back to a partial GET.
     }
 
     const res = await fetch(this.url, {
-      headers: { ...this.entetes, Range: "bytes=0-0" },
+      headers: { ...this.headers, Range: "bytes=0-0" },
     });
-    lireEntetes(res);
-    // Le corps de 1 octet doit être consommé, sinon la connexion reste ouverte.
+    readHeaders(res);
+    // The 1-byte body must be consumed, or the connection stays open.
     await res.arrayBuffer().catch(() => undefined);
   }
 
-  async taille(): Promise<number | null> {
-    await this.sonder();
-    return this.tailleConnue ?? null;
+  async size(): Promise<number | null> {
+    await this.probe();
+    return this.knownSize ?? null;
   }
 
-  async supportePlages(): Promise<boolean> {
-    await this.sonder();
-    return this.plagesOk ?? false;
+  async supportsRanges(): Promise<boolean> {
+    await this.probe();
+    return this.rangesOk ?? false;
   }
 
-  async lire(debut: number, fin: number, signal?: AbortSignal): Promise<Uint8Array> {
+  async read(start: number, end: number, signal?: AbortSignal): Promise<Uint8Array> {
     const res = await fetch(this.url, {
-      headers: { ...this.entetes, Range: `bytes=${debut}-${fin}` },
+      headers: { ...this.headers, Range: `bytes=${start}-${end}` },
       signal,
     });
-    if (!res.ok) throw new Error(`plage ${debut}-${fin} refusée : HTTP ${res.status}`);
+    if (!res.ok) throw new Error(`range ${start}-${end} refused: HTTP ${res.status}`);
     return new Uint8Array(await res.arrayBuffer());
   }
 
-  async *flux(debut: number, signal?: AbortSignal): AsyncIterableIterator<Uint8Array> {
-    const entetes = { ...this.entetes };
-    // `bytes=N-` : à partir de N jusqu'à la fin. Omis quand on part de zéro, pour
-    // ne pas exiger le support des plages inutilement.
-    if (debut > 0) entetes.Range = `bytes=${debut}-`;
+  async *stream(start: number, signal?: AbortSignal): AsyncIterableIterator<Uint8Array> {
+    const headers = { ...this.headers };
+    // `bytes=N-`: from N to the end. Omitted when starting from zero, to
+    // avoid requiring range support unnecessarily.
+    if (start > 0) headers.Range = `bytes=${start}-`;
 
-    const res = await fetch(this.url, { headers: entetes, signal });
-    if (!res.ok) throw new Error(`lecture refusée : HTTP ${res.status}`);
-    if (!res.body) throw new Error("réponse sans corps");
+    const res = await fetch(this.url, { headers, signal });
+    if (!res.ok) throw new Error(`read refused: HTTP ${res.status}`);
+    if (!res.body) throw new Error("response has no body");
 
-    const lecteur = res.body.getReader();
+    const reader = res.body.getReader();
     try {
       for (;;) {
-        const { done, value } = await lecteur.read();
+        const { done, value } = await reader.read();
         if (done) return;
         if (value) yield value;
       }
     } finally {
-      // Abandonner l'itérateur (seek, fermeture) doit couper le téléchargement,
-      // sinon on continue à consommer la bande passante pour rien.
-      await lecteur.cancel().catch(() => undefined);
+      // Abandoning the iterator (seek, close) must cut off the download,
+      // otherwise bandwidth keeps being consumed for nothing.
+      await reader.cancel().catch(() => undefined);
     }
   }
 }

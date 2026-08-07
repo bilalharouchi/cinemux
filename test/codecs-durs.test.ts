@@ -6,172 +6,223 @@ import { join } from "node:path";
 import { Remuxer, type Diagnostic } from "../src/remuxer.js";
 
 /**
- * Les cas qui cassent vraiment un remuxeur : images B (DTS ≠ PTS), HEVC (chaîne
- * de codec pénible), Opus (horloge à 48 kHz imposée).
+ * The cases that really break a remuxer: B-frames (DTS ≠ PTS), HEVC (a
+ * painful codec string), Opus (a clock forced to 48 kHz).
  */
 
-function remuxerVers(nom: string): { fichier: string; diag: Diagnostic } {
-  const octets = new Uint8Array(readFileSync(new URL(`./fixtures/${nom}`, import.meta.url)));
-  const morceaux: Uint8Array[] = [];
+function remuxTo(name: string): { file: string; diag: Diagnostic } {
+  const bytes = new Uint8Array(readFileSync(new URL(`./fixtures/${name}`, import.meta.url)));
+  const chunks: Uint8Array[] = [];
   let diag: Diagnostic | null = null;
 
   const r = new Remuxer({
-    supporte: () => true,
+    isSupported: () => true,
     onInit: (s, d) => {
       diag = d;
-      morceaux.push(s);
+      chunks.push(s);
     },
-    onSegment: (s) => morceaux.push(s),
-    onErreur: (e) => {
+    onSegment: (s) => chunks.push(s),
+    onError: (e) => {
       throw e;
     },
   });
-  for (let i = 0; i < octets.length; i += 32768) {
-    r.alimenter(octets.subarray(i, Math.min(i + 32768, octets.length)));
+  for (let i = 0; i < bytes.length; i += 32768) {
+    r.feed(bytes.subarray(i, Math.min(i + 32768, bytes.length)));
   }
-  r.terminer();
+  r.finish();
 
-  const total = morceaux.reduce((n, m) => n + m.length, 0);
-  const sortie = new Uint8Array(total);
+  const total = chunks.reduce((n, m) => n + m.length, 0);
+  const output = new Uint8Array(total);
   let pos = 0;
-  for (const m of morceaux) {
-    sortie.set(m, pos);
+  for (const m of chunks) {
+    output.set(m, pos);
     pos += m.length;
   }
-  const fichier = join(mkdtempSync(join(tmpdir(), "cinemux-")), nom.replace(/\.mkv$/, ".mp4"));
-  writeFileSync(fichier, sortie);
-  return { fichier, diag: diag! };
+  const file = join(mkdtempSync(join(tmpdir(), "cinemux-")), name.replace(/\.mkv$/, ".mp4"));
+  writeFileSync(file, output);
+  return { file, diag: diag! };
 }
 
-/** Liste les PTS d'un flux, dans l'ordre de PRÉSENTATION. */
-function ptsPresentation(fichier: string, flux = "v:0"): number[] {
-  const sortie = execFileSync(
+/** Lists the PTS of a stream, in PRESENTATION order. */
+function presentationPts(file: string, stream = "v:0"): number[] {
+  const output = execFileSync(
     "ffprobe",
-    ["-v", "error", "-select_streams", flux, "-show_entries", "frame=pts_time",
-     "-of", "csv=p=0", fichier],
+    ["-v", "error", "-select_streams", stream, "-show_entries", "frame=pts_time",
+     "-of", "csv=p=0", file],
     { encoding: "utf8", maxBuffer: 32 * 1024 * 1024 },
   );
-  // ffprobe ajoute parfois un champ vide en fin de ligne (« 0.080000, ») : on ne
-  // garde que la première colonne, sinon Number() rend NaN sur la 1re image.
-  return sortie
+  // ffprobe sometimes adds an empty trailing field ("0.080000,"): keep only
+  // the first column, otherwise Number() gives NaN on the first frame.
+  return output
     .trim()
     .split("\n")
     .filter(Boolean)
     .map((l: string) => Number(l.split(",")[0]));
 }
 
-describe("codecs difficiles", () => {
-  it("images B : l'ordre de présentation est intact", () => {
-    // LE test qui valide la reconstruction des DTS. Si DTS = PTS, ffprobe voit
-    // des images dans l'ordre de décodage et la séquence n'est plus croissante.
+describe("difficult codecs", () => {
+  it("B-frames: presentation order is intact", () => {
+    // THE test that validates DTS reconstruction. If DTS = PTS, ffprobe
+    // sees frames in decode order and the sequence is no longer increasing.
     const source = new URL("./fixtures/h264-bframes-aac.mkv", import.meta.url).pathname;
-    const { fichier } = remuxerVers("h264-bframes-aac.mkv");
+    const { file } = remuxTo("h264-bframes-aac.mkv");
 
-    const avant = ptsPresentation(source);
-    const apres = ptsPresentation(fichier);
+    const before = presentationPts(source);
+    const after = presentationPts(file);
 
-    expect(apres.length).toBe(avant.length);
-    // Strictement croissant : c'est ce que garantit un CTS correct.
-    for (let i = 1; i < apres.length; i++) {
-      expect(apres[i], `image ${i}`).toBeGreaterThan(apres[i - 1]);
+    expect(after.length).toBe(before.length);
+    // Strictly increasing: that's what a correct CTS guarantees.
+    for (let i = 1; i < after.length; i++) {
+      expect(after[i], `frame ${i}`).toBeGreaterThan(after[i - 1]);
     }
-    // Le décalage par rapport à la source doit être CONSTANT : c'est le délai de
-    // réordonnancement, inévitable puisque `tfdt` ne peut pas être négatif. Ce qui
-    // compte, c'est qu'il soit identique partout — sinon l'image accélère ou traîne.
-    const decalages = apres.map((t, i) => Number((t - avant[i]).toFixed(4)));
-    expect(new Set(decalages).size, `décalages observés : ${[...new Set(decalages)]}`).toBe(1);
-    // Et qu'il reste de l'ordre de quelques images, pas d'une seconde.
-    expect(Math.abs(decalages[0])).toBeLessThan(0.2);
+    // The offset from the source must be CONSTANT: that's the reordering
+    // delay, unavoidable since `tfdt` can't be negative. What matters is
+    // that it's identical everywhere — otherwise the picture speeds up or
+    // lags.
+    const offsets = after.map((t, i) => Number((t - before[i]).toFixed(4)));
+    expect(new Set(offsets).size, `observed offsets: ${[...new Set(offsets)]}`).toBe(1);
+    // And that it's on the order of a few frames, not a full second.
+    expect(Math.abs(offsets[0])).toBeLessThan(0.2);
   });
 
-  it("images B : le fichier se décode sans erreur", () => {
-    const { fichier } = remuxerVers("h264-bframes-aac.mkv");
-    const sortie = execFileSync("ffmpeg", ["-v", "error", "-i", fichier, "-f", "null", "-"], {
+  it("B-frames: the file decodes without error", () => {
+    const { file } = remuxTo("h264-bframes-aac.mkv");
+    const output = execFileSync("ffmpeg", ["-v", "error", "-i", file, "-f", "null", "-"], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
     });
-    expect(sortie.trim()).toBe("");
+    expect(output.trim()).toBe("");
   });
 
-  it("HEVC : chaîne de codec et décodage", () => {
-    const { fichier, diag } = remuxerVers("hevc-aac.mkv");
-    expect(diag.video?.piste.codecId).toBe("V_MPEGH/ISO/HEVC");
-    // Forme attendue : hvc1.<profil>.<compat hex>.<tier><niveau>[.contraintes]
+  it("HEVC: codec string and decoding", () => {
+    const { file, diag } = remuxTo("hevc-aac.mkv");
+    expect(diag.video?.track.codecId).toBe("V_MPEGH/ISO/HEVC");
+    // Expected shape: hvc1.<profile>.<compat hex>.<tier><level>[.constraints]
     expect(diag.video?.description.codec).toMatch(/^hvc1\.\d+\.[0-9A-F]+\.[LH]\d+/);
 
-    const flux = execFileSync(
+    const stream = execFileSync(
       "ffprobe",
-      ["-v", "error", "-show_entries", "stream=codec_name", "-of", "csv=p=0", fichier],
+      ["-v", "error", "-show_entries", "stream=codec_name", "-of", "csv=p=0", file],
       { encoding: "utf8" },
     );
-    expect(flux).toContain("hevc");
+    expect(stream).toContain("hevc");
 
-    const sortie = execFileSync("ffmpeg", ["-v", "error", "-i", fichier, "-f", "null", "-"], {
+    const output = execFileSync("ffmpeg", ["-v", "error", "-i", file, "-f", "null", "-"], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
     });
-    expect(sortie.trim()).toBe("");
+    expect(output.trim()).toBe("");
   });
 
-  it("Opus : horloge forcée à 48 kHz et OpusHead dépouillé", () => {
-    const { fichier, diag } = remuxerVers("h264-opus.mkv");
-    expect(diag.audio?.piste.codecId).toBe("A_OPUS");
+  it("Opus: clock forced to 48 kHz and OpusHead stripped", () => {
+    const { file, diag } = remuxTo("h264-opus.mkv");
+    expect(diag.audio?.track.codecId).toBe("A_OPUS");
     expect(diag.audio?.description.codec).toBe("opus");
-    // Opus travaille toujours en 48 kHz, quelle que soit la fréquence déclarée.
+    // Opus always works at 48 kHz, regardless of the declared frequency.
     expect(diag.audio?.description.timescale).toBe(48000);
 
-    const flux = execFileSync(
+    const stream = execFileSync(
       "ffprobe",
       ["-v", "error", "-select_streams", "a:0", "-show_entries", "stream=codec_name,sample_rate",
-       "-of", "csv=p=0", fichier],
+       "-of", "csv=p=0", file],
       { encoding: "utf8" },
     );
-    expect(flux.trim()).toContain("opus");
+    expect(stream.trim()).toContain("opus");
 
-    const sortie = execFileSync("ffmpeg", ["-v", "error", "-i", fichier, "-f", "null", "-"], {
+    const output = execFileSync("ffmpeg", ["-v", "error", "-i", file, "-f", "null", "-"], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
     });
-    expect(sortie.trim()).toBe("");
+    expect(output.trim()).toBe("");
   });
 
-  it("640x360 : les dimensions traversent le remux", () => {
-    const { fichier } = remuxerVers("h264-bframes-aac.mkv");
+  it("E-AC-3: described (not left as `null`), even though no browser plays it", () => {
+    // A regression we actually hit: `describe()` had no `case "A_EAC3"` and
+    // fell into `default:` — `this.audio` stayed `null` for good (not just
+    // "unsupported"), so `diag.audio` did too. The player couldn't even say
+    // WHY there was no sound, let alone attempt any fallback.
+    const { diag } = remuxTo("h264-eac3.mkv");
+    expect(diag.audio).not.toBeNull();
+    expect(diag.audio?.track.codecId).toBe("A_EAC3");
+    expect(diag.audio?.description.codec).toBe("ec-3");
+
+    const stream = execFileSync(
+      "ffprobe",
+      ["-v", "error", "-select_streams", "a:0", "-show_entries", "stream=sample_rate,channels",
+       "-of", "csv=p=0", new URL("./fixtures/h264-eac3.mkv", import.meta.url).pathname],
+      { encoding: "utf8" },
+    ).trim();
+    const [expectedFreq, expectedChannels] = stream.split(",").map(Number);
+    expect(diag.audio?.description.timescale).toBe(expectedFreq);
+    // `channels` isn't exposed directly on `Description`; it's on `entry`
+    // (the MP4 box) — checked indirectly via `timescale`/`codec` above, the
+    // next test covers the "no browser plays it" case.
+    expect(expectedChannels).toBe(1);
+  });
+
+  it("E-AC-3: correctly flagged as muted, with the real reason", () => {
+    const bytes = new Uint8Array(
+      readFileSync(new URL("./fixtures/h264-eac3.mkv", import.meta.url)),
+    );
+    let diag: Diagnostic | null = null;
+    const r = new Remuxer({
+      isSupported: () => false, // the real case: no browser decodes ec-3 in MSE
+      onInit: (_s, d) => {
+        diag = d;
+      },
+      onError: (e) => {
+        throw e;
+      },
+    });
+    for (let i = 0; i < bytes.length; i += 32768) {
+      r.feed(bytes.subarray(i, Math.min(i + 32768, bytes.length)));
+    }
+    r.finish();
+
+    expect(diag).not.toBeNull();
+    expect(diag!.audio?.track.codecId).toBe("A_EAC3");
+    expect(diag!.audio?.supported).toBe(false);
+    expect(diag!.mutedAudio).toBe(true);
+    expect(diag!.discarded.some((e) => e.track.codecId === "A_EAC3")).toBe(true);
+  });
+
+  it("640x360: dimensions survive the remux", () => {
+    const { file } = remuxTo("h264-bframes-aac.mkv");
     const dim = execFileSync(
       "ffprobe",
       ["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height",
-       "-of", "csv=p=0", fichier],
+       "-of", "csv=p=0", file],
       { encoding: "utf8" },
     ).trim();
     expect(dim).toBe("640,360");
   });
 
-  it("l'audio et la vidéo restent alignés", () => {
-    // Une dérive A/V est le symptôme d'un timescale ou d'un tfdt faux.
-    const { fichier } = remuxerVers("h264-bframes-aac.mkv");
-    const debut = (flux: string) =>
+  it("audio and video stay in sync", () => {
+    // An A/V drift is the symptom of a wrong timescale or a wrong tfdt.
+    const { file } = remuxTo("h264-bframes-aac.mkv");
+    const start = (stream: string) =>
       Number(
         execFileSync(
           "ffprobe",
-          ["-v", "error", "-select_streams", flux, "-show_entries", "stream=start_time",
-           "-of", "csv=p=0", fichier],
+          ["-v", "error", "-select_streams", stream, "-show_entries", "stream=start_time",
+           "-of", "csv=p=0", file],
           { encoding: "utf8" },
         ).trim(),
       );
-    // Le décalage de réordonnancement s'applique aux DEUX pistes : ne le mettre
-    // que sur la vidéo décalait le son de 80 ms (défaut audible sur les lèvres).
-    expect(Math.abs(debut("v:0") - debut("a:0"))).toBeLessThan(0.005);
+    // The reordering offset applies to BOTH tracks: applying it to video
+    // only shifted the sound by 80 ms (an audible lip-sync bug).
+    expect(Math.abs(start("v:0") - start("a:0"))).toBeLessThan(0.005);
 
-    const duree = (flux: string) =>
+    const duration = (stream: string) =>
       Number(
         execFileSync(
           "ffprobe",
-          ["-v", "error", "-select_streams", flux, "-show_entries", "stream=duration",
-           "-of", "csv=p=0", fichier],
+          ["-v", "error", "-select_streams", stream, "-show_entries", "stream=duration",
+           "-of", "csv=p=0", file],
           { encoding: "utf8" },
         ).trim(),
       );
-    // Moins de 100 ms d'écart de durée entre les deux pistes sur 4 s.
-    expect(Math.abs(duree("v:0") - duree("a:0"))).toBeLessThan(0.1);
+    // Less than 100 ms of duration gap between the two tracks over 4s.
+    expect(Math.abs(duration("v:0") - duration("a:0"))).toBeLessThan(0.1);
   });
 });

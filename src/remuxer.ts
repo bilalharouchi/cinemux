@@ -1,63 +1,72 @@
-import { MatroskaDemuxer, type Echantillon, type Piste } from "./matroska/demuxer.js";
+import { MatroskaDemuxer, type Sample, type Track } from "./matroska/demuxer.js";
 import { TrackType } from "./ebml/ids.js";
-import { CodecNonSupporte, decrire, mimeDe, type Description } from "./codecs/index.js";
+import { UnsupportedCodec, describe, mimeFor, type Description } from "./codecs/index.js";
 import {
-  reconstruireDts,
+  reconstructDts,
   segmentInit,
-  segmentMedia,
-  type EchantillonMux,
-  type FragmentPiste,
-  type PisteMux,
+  mediaSegment,
+  type MuxSample,
+  type TrackFragment,
+  type MuxTrack,
 } from "./mp4/muxer.js";
 
 /**
- * Remux Matroska → fMP4.
+ * Matroska → fMP4 remux.
  *
- * Reçoit des octets de MKV, produit un segment d'initialisation puis des segments
- * média prêts pour `SourceBuffer.appendBuffer`. Aucun échantillon n'est réencodé :
- * les octets du bitstream traversent tels quels.
+ * Takes in MKV bytes, produces an init segment then media segments ready
+ * for `SourceBuffer.appendBuffer`. No sample is ever re-encoded: the
+ * bitstream bytes pass through as-is.
  */
 
-export type PisteChoisie = {
-  piste: Piste;
+export type ChosenTrack = {
+  track: Track;
   description: Description;
-  /** Le navigateur courant sait-il décoder ce codec ? */
-  supportee: boolean;
+  /** Can the current browser decode this codec? */
+  supported: boolean;
 };
 
 export type Diagnostic = {
-  video: PisteChoisie | null;
-  audio: PisteChoisie | null;
-  /** Pistes écartées, avec la raison — l'utilisateur a droit à une explication. */
-  ecartees: { piste: Piste; raison: string }[];
-  /** Type MIME des pistes RÉELLEMENT muxées. */
+  video: ChosenTrack | null;
+  audio: ChosenTrack | null;
+  /** Discarded tracks, with the reason — the user deserves an explanation. */
+  discarded: { track: Track; reason: string }[];
+  /** MIME type of the tracks ACTUALLY muxed. */
   mime: string;
   /**
-   * Vrai quand le fichier a une piste audio qu'aucun décodeur du navigateur ne
-   * prend : l'image jouera, mais en silence. À l'appelant de proposer une autre
-   * version plutôt que de laisser l'utilisateur devant un film muet.
+   * True when the file has an audio track that no browser decoder handles:
+   * the picture will play, but silently. It's up to the caller to offer
+   * another version rather than leaving the user in front of a mute movie.
    */
-  audioMuet: boolean;
-  dureeMs: number | null;
+  mutedAudio: boolean;
+  durationMs: number | null;
 };
 
-export type OptionsRemuxer = {
+export type RemuxerOptions = {
   onInit?: (segment: Uint8Array, diag: Diagnostic) => void;
   onSegment?: (segment: Uint8Array) => void;
-  onErreur?: (e: Error) => void;
+  onError?: (e: Error) => void;
   /**
-   * Durée cible d'un fragment. Trop court, on multiplie les `appendBuffer` ;
-   * trop long, le démarrage traîne. 500 ms est un bon compromis mesuré.
+   * Target duration of a fragment. Too short, and `appendBuffer` calls pile
+   * up; too long, and startup drags. 500 ms is a good measured compromise.
    */
-  dureeFragmentMs?: number;
-  /** Langue préférée pour la piste audio (« fr », « fre », « fr-FR »). */
-  languePreferee?: string;
-  /** Remplaçable en test, où `MediaSource` n'existe pas. */
-  supporte?: (mime: string) => boolean;
+  fragmentDurationMs?: number;
+  /** Preferred language for the audio track ("fr", "fre", "fr-FR"). */
+  preferredLanguage?: string;
+  /** Overridable in tests, where `MediaSource` doesn't exist. */
+  isSupported?: (mime: string) => boolean;
+  /**
+   * Frame of the CHOSEN audio track that couldn't be muxed (a codec the
+   * browser doesn't decode natively — typically AC-3). Normally silently
+   * dropped in `store()`; with this callback, the caller (`player.ts`)
+   * decodes it itself via `codecs/ac3/` and plays the sound through a path
+   * other than MediaSource — the Web Audio API, synced to
+   * `<video>.currentTime`.
+   */
+  onUnmuxedSample?: (s: Sample, track: Track, timestampScaleNs: number) => void;
 };
 
-/** Ordre de préférence audio à qualité égale : ce que le navigateur lit le mieux. */
-const RANG_AUDIO: Record<string, number> = {
+/** Audio preference order at equal quality: what the browser handles best. */
+const AUDIO_RANK: Record<string, number> = {
   A_AAC: 0,
   A_OPUS: 1,
   A_FLAC: 2,
@@ -67,13 +76,13 @@ const RANG_AUDIO: Record<string, number> = {
   A_DTS: 6,
 };
 
-function supportParDefaut(mime: string): boolean {
+function defaultSupport(mime: string): boolean {
   if (typeof MediaSource === "undefined") return false;
   return MediaSource.isTypeSupported(mime);
 }
 
-/** Deux codes langue désignent-ils la même langue ? (`fre`, `fra`, `fr`, `fr-FR`) */
-function memeLangue(a: string, b: string): boolean {
+/** Do two language codes name the same language? (`fre`, `fra`, `fr`, `fr-FR`) */
+function sameLanguage(a: string, b: string): boolean {
   const n = (s: string) => {
     const base = s.toLowerCase().split(/[-_]/)[0];
     return base === "fra" || base === "fre" ? "fr" : base;
@@ -83,28 +92,28 @@ function memeLangue(a: string, b: string): boolean {
 
 export class Remuxer {
   private readonly demuxer: MatroskaDemuxer;
-  private readonly supporte: (mime: string) => boolean;
-  private readonly dureeFragmentTicks: number;
+  private readonly isSupported: (mime: string) => boolean;
+  private readonly fragmentDurationTicks: number;
 
-  private video: PisteChoisie | null = null;
-  private audio: PisteChoisie | null = null;
-  private muxVideo: PisteMux | null = null;
-  private muxAudio: PisteMux | null = null;
+  private video: ChosenTrack | null = null;
+  private audio: ChosenTrack | null = null;
+  private muxVideo: MuxTrack | null = null;
+  private muxAudio: MuxTrack | null = null;
 
-  private etat: "pistes" | "amorce" | "actif" | "arrete" = "pistes";
-  private enAttente: Echantillon[] = [];
-  private tampons = new Map<number, Echantillon[]>();
+  private state: "tracks" | "priming" | "active" | "stopped" = "tracks";
+  private pending: Sample[] = [];
+  private buffers = new Map<number, Sample[]>();
   private sequence = 1;
   private diag: Diagnostic | null = null;
 
-  constructor(private readonly opt: OptionsRemuxer = {}) {
-    this.supporte = opt.supporte ?? supportParDefaut;
-    // Converti en Track Ticks à la première utilisation (timestampScale connu).
-    this.dureeFragmentTicks = opt.dureeFragmentMs ?? 500;
+  constructor(private readonly opt: RemuxerOptions = {}) {
+    this.isSupported = opt.isSupported ?? defaultSupport;
+    // Converted to Track Ticks on first use (timestampScale known by then).
+    this.fragmentDurationTicks = opt.fragmentDurationMs ?? 500;
 
     this.demuxer = new MatroskaDemuxer({
-      onPistes: (pistes) => this.choisirPistes(pistes),
-      onEchantillon: (e) => this.recevoir(e),
+      onTracks: (tracks) => this.chooseTracks(tracks),
+      onSample: (s) => this.receive(s),
     });
   }
 
@@ -112,350 +121,358 @@ export class Remuxer {
     return this.demuxer.cues;
   }
 
-  get dureeMs() {
-    return this.demuxer.dureeMs;
+  get durationMs() {
+    return this.demuxer.durationMs;
   }
 
   get diagnostic() {
     return this.diag;
   }
 
-  alimenter(morceau: Uint8Array) {
-    if (this.etat === "arrete") return;
+  feed(chunk: Uint8Array) {
+    if (this.state === "stopped") return;
     try {
-      this.demuxer.alimenter(morceau);
+      this.demuxer.feed(chunk);
     } catch (e) {
-      this.etat = "arrete";
-      this.opt.onErreur?.(e instanceof Error ? e : new Error(String(e)));
+      this.state = "stopped";
+      this.opt.onError?.(e instanceof Error ? e : new Error(String(e)));
     }
   }
 
-  /** Après un seek : vide les tampons et repart à l'offset donné. */
-  repositionner(offsetFichier: number) {
-    this.demuxer.repositionner(offsetFichier);
-    this.tampons.clear();
-    this.enAttente = [];
+  /** After a seek: clears the buffers and restarts at the given offset. */
+  seekTo(fileOffset: number) {
+    this.demuxer.seekTo(fileOffset);
+    this.buffers.clear();
+    this.pending = [];
   }
 
-  /** Pousse le dernier fragment partiel — à appeler en fin de flux. */
-  terminer() {
-    this.vider(true);
+  /** Pushes the last partial fragment — call at the end of the stream. */
+  finish() {
+    this.flush(true);
   }
 
   // -------------------------------------------------------------------------
 
-  private choisirPistes(pistes: Piste[]) {
-    const ecartees: { piste: Piste; raison: string }[] = [];
+  private chooseTracks(tracks: Track[]) {
+    const discarded: { track: Track; reason: string }[] = [];
 
-    /** Décrit une piste et teste son support, en récoltant les refus. */
-    const evaluer = (piste: Piste, premiereTrame?: Uint8Array): PisteChoisie | null => {
+    /** Describes a track and tests its support, collecting rejections. */
+    const evaluate = (track: Track, firstFrame?: Uint8Array): ChosenTrack | null => {
       try {
-        const description = decrire(piste, premiereTrame);
-        const mime = mimeDe(description);
-        return { piste, description, supportee: this.supporte(mime) };
+        const description = describe(track, firstFrame);
+        const mime = mimeFor(description);
+        return { track, description, supported: this.isSupported(mime) };
       } catch (e) {
-        ecartees.push({
-          piste,
-          raison: e instanceof CodecNonSupporte ? e.raison : String(e),
+        discarded.push({
+          track,
+          reason: e instanceof UnsupportedCodec ? e.reason : String(e),
         });
         return null;
       }
     };
 
-    // --- Vidéo : la piste par défaut, sinon la première décrivable ---
-    for (const piste of this.demuxer.pistesParType(TrackType.VIDEO)) {
-      const choix = evaluer(piste);
-      if (choix?.supportee) {
-        this.video = choix;
+    // --- Video: the default track, otherwise the first describable one ---
+    for (const track of this.demuxer.tracksByType(TrackType.VIDEO)) {
+      const choice = evaluate(track);
+      if (choice?.supported) {
+        this.video = choice;
         break;
       }
-      if (choix && !this.video) {
-        this.video = choix; // gardée en dernier recours, marquée non supportée
-        ecartees.push({ piste, raison: `${description(choix)} non décodable ici` });
+      if (choice && !this.video) {
+        this.video = choice; // kept as a last resort, marked unsupported
+        discarded.push({ track, reason: `${codecLabel(choice)} not decodable here` });
       }
     }
 
-    // --- Audio : d'abord ce que le navigateur sait lire, puis la langue ---
-    const candidats = this.demuxer
-      .pistesParType(TrackType.AUDIO)
-      .map((piste) => ({ piste, choix: evaluer(piste) }))
-      .filter((c): c is { piste: Piste; choix: PisteChoisie } => c.choix !== null);
+    // --- Audio: first what the browser can play, then language ---
+    const candidates = this.demuxer
+      .tracksByType(TrackType.AUDIO)
+      .map((track) => ({ track, choice: evaluate(track) }))
+      .filter((c): c is { track: Track; choice: ChosenTrack } => c.choice !== null);
 
-    candidats.sort((a, b) => {
-      // 1. Décodable ici — un AC-3 en français est inutile si rien ne le joue.
-      if (a.choix.supportee !== b.choix.supportee) return a.choix.supportee ? -1 : 1;
-      // 2. Langue demandée.
-      if (this.opt.languePreferee) {
-        const la = memeLangue(a.piste.langue, this.opt.languePreferee);
-        const lb = memeLangue(b.piste.langue, this.opt.languePreferee);
+    candidates.sort((a, b) => {
+      // 1. Decodable here — a French AC-3 track is useless if nothing plays it.
+      if (a.choice.supported !== b.choice.supported) return a.choice.supported ? -1 : 1;
+      // 2. Requested language.
+      if (this.opt.preferredLanguage) {
+        const la = sameLanguage(a.track.language, this.opt.preferredLanguage);
+        const lb = sameLanguage(b.track.language, this.opt.preferredLanguage);
         if (la !== lb) return la ? -1 : 1;
       }
-      // 3. Codec le mieux traité par les navigateurs.
-      const ra = RANG_AUDIO[a.piste.codecId] ?? 9;
-      const rb = RANG_AUDIO[b.piste.codecId] ?? 9;
+      // 3. Codec best handled by browsers.
+      const ra = AUDIO_RANK[a.track.codecId] ?? 9;
+      const rb = AUDIO_RANK[b.track.codecId] ?? 9;
       if (ra !== rb) return ra - rb;
-      // 4. Piste marquée par défaut.
-      return Number(b.piste.pardefaut) - Number(a.piste.pardefaut);
+      // 4. Track flagged as default.
+      return Number(b.track.default) - Number(a.track.default);
     });
 
-    const retenu = candidats[0];
-    if (retenu) {
-      this.audio = retenu.choix;
-      for (const c of candidats.slice(1)) {
-        ecartees.push({ piste: c.piste, raison: "autre piste préférée" });
+    const chosen = candidates[0];
+    if (chosen) {
+      this.audio = chosen.choice;
+      for (const c of candidates.slice(1)) {
+        discarded.push({ track: c.track, reason: "another track preferred" });
       }
     }
 
-    // L'AC-3 n'a pas de CodecPrivate : sa configuration n'est lisible que dans la
-    // première trame. On attend donc de l'avoir avant d'émettre l'initialisation.
-    const besoinTrame = this.audio === null && this.demuxer.pistesParType(TrackType.AUDIO).length > 0;
-    this.etat = besoinTrame ? "amorce" : "actif";
+    // AC-3 has no CodecPrivate: its configuration is only readable in the
+    // first frame. So we wait until we have it before emitting init.
+    const needsFrame = this.audio === null && this.demuxer.tracksByType(TrackType.AUDIO).length > 0;
+    this.state = needsFrame ? "priming" : "active";
 
-    if (this.etat === "actif") this.emettreInit(ecartees);
-    else this.ecarteesEnAttente = ecartees;
+    if (this.state === "active") this.emitInit(discarded);
+    else this.pendingDiscarded = discarded;
   }
 
-  private ecarteesEnAttente: { piste: Piste; raison: string }[] = [];
+  private pendingDiscarded: { track: Track; reason: string }[] = [];
 
-  private emettreInit(ecartees: { piste: Piste; raison: string }[]) {
-    const pistes: PisteMux[] = [];
+  private emitInit(discarded: { track: Track; reason: string }[]) {
+    const tracks: MuxTrack[] = [];
     let id = 1;
     if (this.video) {
       this.muxVideo = { id: id++, description: this.video.description };
-      pistes.push(this.muxVideo);
+      tracks.push(this.muxVideo);
     }
 
     /**
-     * Une piste audio que le navigateur ne décode pas est EXCLUE du muxage.
+     * An audio track the browser can't decode is EXCLUDED from muxing.
      *
-     * POURQUOI — `MediaSource.isTypeSupported` juge la chaîne COMPLÈTE : un
-     * `hvc1.2.4.H150.B0,ac-3` est refusé en bloc, alors que la vidéo seule
-     * passerait. La garder condamnait tout le fichier à cause du son.
+     * WHY — `MediaSource.isTypeSupported` judges the WHOLE codec string: a
+     * `hvc1.2.4.H150.B0,ac-3` is rejected outright, even though the video
+     * alone would pass. Keeping it would condemn the whole file over its
+     * audio.
      *
-     * Elle reste dans le diagnostic avec `supportee: false` : l'appelant sait
-     * qu'il y a du son qu'il ne peut pas jouer, et peut proposer autre chose.
+     * It stays in the diagnostic with `supported: false`: the caller knows
+     * there's audio it can't play, and can offer something else.
      */
-    const audioJouable = this.audio?.supportee ? this.audio : null;
-    if (this.audio && !audioJouable) {
-      ecartees.push({
-        piste: this.audio.piste,
-        raison: `${this.audio.piste.codecId} non décodable par ce navigateur — image conservée, son muet`,
+    const playableAudio = this.audio?.supported ? this.audio : null;
+    if (this.audio && !playableAudio) {
+      discarded.push({
+        track: this.audio.track,
+        reason: `${this.audio.track.codecId} not decodable by this browser — picture kept, audio muted`,
       });
     }
-    if (audioJouable) {
-      this.muxAudio = { id: id++, description: audioJouable.description };
-      pistes.push(this.muxAudio);
+    if (playableAudio) {
+      this.muxAudio = { id: id++, description: playableAudio.description };
+      tracks.push(this.muxAudio);
     }
 
-    if (pistes.length === 0) {
-      this.etat = "arrete";
-      this.opt.onErreur?.(new Error("aucune piste exploitable dans ce fichier"));
+    if (tracks.length === 0) {
+      this.state = "stopped";
+      this.opt.onError?.(new Error("no usable track in this file"));
       return;
     }
 
-    const descriptions = pistes.map((p) => p.description);
+    const descriptions = tracks.map((t) => t.description);
     this.diag = {
       video: this.video,
       audio: this.audio,
-      ecartees,
-      // Ne décrit que ce qui est réellement muxé : inclure une piste exclue
-      // ferait échouer `isTypeSupported` sur un flux qui, lui, passerait.
-      mime: mimeDe(...descriptions),
-      /** Le fichier a du son, mais ce navigateur ne sait pas le décoder. */
-      audioMuet: this.audio != null && !this.audio.supportee,
-      dureeMs: this.demuxer.dureeMs,
+      discarded,
+      // Only describes what's actually muxed: including an excluded track
+      // would make `isTypeSupported` fail on a stream that would otherwise pass.
+      mime: mimeFor(...descriptions),
+      /** The file has audio, but this browser can't decode it. */
+      mutedAudio: this.audio != null && !this.audio.supported,
+      durationMs: this.demuxer.durationMs,
     };
 
-    this.etat = "actif";
-    this.opt.onInit?.(segmentInit(pistes, this.demuxer.dureeMs ?? 0), this.diag);
+    this.state = "active";
+    this.opt.onInit?.(segmentInit(tracks, this.demuxer.durationMs ?? 0), this.diag);
 
-    // Les échantillons arrivés pendant l'attente ne sont pas perdus.
-    const enAttente = this.enAttente;
-    this.enAttente = [];
-    for (const e of enAttente) this.ranger(e);
-    this.vider(false);
+    // Samples that arrived while waiting aren't lost.
+    const pending = this.pending;
+    this.pending = [];
+    for (const s of pending) this.store(s);
+    this.flush(false);
   }
 
-  private recevoir(e: Echantillon) {
-    if (this.etat === "arrete") return;
+  private receive(s: Sample) {
+    if (this.state === "stopped") return;
 
-    if (this.etat === "amorce") {
-      this.enAttente.push(e);
-      // On ne retente la description que sur une trame audio.
-      const piste = this.demuxer.pistes.find((p) => p.numero === e.piste);
-      if (piste?.type === TrackType.AUDIO) {
+    if (this.state === "priming") {
+      this.pending.push(s);
+      // Description is only retried on an audio frame.
+      const track = this.demuxer.tracks.find((t) => t.number === s.track);
+      if (track?.type === TrackType.AUDIO) {
         try {
-          const description = decrire(piste, e.donnees);
-          this.audio = { piste, description, supportee: this.supporte(mimeDe(description)) };
+          const description = describe(track, s.data);
+          this.audio = { track, description, supported: this.isSupported(mimeFor(description)) };
         } catch {
-          // Toujours pas descriptible : on abandonne l'audio et on joue la vidéo.
-          this.ecarteesEnAttente.push({ piste, raison: "configuration audio illisible" });
+          // Still not describable: audio is given up on, video plays on its own.
+          this.pendingDiscarded.push({ track, reason: "unreadable audio configuration" });
         }
-        this.emettreInit(this.ecarteesEnAttente);
+        this.emitInit(this.pendingDiscarded);
       }
       return;
     }
 
-    if (this.etat !== "actif") return;
-    this.ranger(e);
-    this.vider(false);
+    if (this.state !== "active") return;
+    this.store(s);
+    this.flush(false);
   }
 
-  private ranger(e: Echantillon) {
-    const cible = this.cibleDe(e.piste);
-    if (!cible) return; // piste non retenue : on jette, ça n'ira nulle part
-    let file = this.tampons.get(e.piste);
-    if (!file) this.tampons.set(e.piste, (file = []));
-    file.push(e);
+  private store(s: Sample) {
+    const target = this.targetFor(s.track);
+    if (!target) {
+      // Chosen track (`this.audio`) but not muxed: not just "not chosen",
+      // this is the AC-3 case — offer the raw frame before dropping it for good.
+      if (this.audio && s.track === this.audio.track.number) {
+        this.opt.onUnmuxedSample?.(s, this.audio.track, this.demuxer.timestampScale);
+      }
+      return;
+    }
+    let queue = this.buffers.get(s.track);
+    if (!queue) this.buffers.set(s.track, (queue = []));
+    queue.push(s);
   }
 
-  private cibleDe(numeroPiste: number): PisteMux | null {
-    if (this.video && this.muxVideo && numeroPiste === this.video.piste.numero) return this.muxVideo;
-    if (this.audio && this.muxAudio && numeroPiste === this.audio.piste.numero) return this.muxAudio;
+  private targetFor(trackNumber: number): MuxTrack | null {
+    if (this.video && this.muxVideo && trackNumber === this.video.track.number) return this.muxVideo;
+    if (this.audio && this.muxAudio && trackNumber === this.audio.track.number) return this.muxAudio;
     return null;
   }
 
-  /** Ticks Matroska → ticks de la piste MP4. */
-  private convertir(ticks: number, timescale: number): number {
-    const secondes = (ticks * this.demuxer.timestampScale) / 1e9;
-    return Math.round(secondes * timescale);
+  /** Matroska ticks → MP4 track ticks. */
+  private convert(ticks: number, timescale: number): number {
+    const seconds = (ticks * this.demuxer.timestampScale) / 1e9;
+    return Math.round(seconds * timescale);
   }
 
   /**
-   * Décalage de présentation global, en secondes.
+   * Global presentation offset, in seconds.
    *
-   * POURQUOI — avec des images B, le premier DTS est antérieur au premier PTS.
-   * Comme `tfdt` est non signé, on ne peut pas écrire un DTS négatif : la seule
-   * issue est d'avancer TOUTE la présentation du délai de réordonnancement.
+   * WHY — with B-frames, the first DTS comes before the first PTS. Since
+   * `tfdt` is unsigned, a negative DTS can't be written: the only way out
+   * is to advance the ENTIRE presentation by the reordering delay.
    *
-   * Ce décalage doit s'appliquer à l'audio AUSSI. Ne le mettre que sur la vidéo,
-   * c'est décaler le son de 80 ms — un défaut de synchronisation labial audible,
-   * et le vrai bug que ce champ corrige.
+   * This offset must apply to audio TOO. Applying it only to video shifts
+   * the sound by 80 ms — an audible lip-sync bug, and the actual bug this
+   * field fixes.
    */
-  private decalageSecondes: number | null = null;
+  private presentationOffsetSeconds: number | null = null;
 
-  /** Calcule le délai de réordonnancement d'un lot vidéo, en secondes. */
-  private delaiReordre(pts: number[], dts: number[], timescale: number): number {
+  /** Computes a video batch's reordering delay, in seconds. */
+  private reorderDelay(pts: number[], dts: number[], timescale: number): number {
     let max = 0;
     for (let i = 0; i < pts.length; i++) max = Math.max(max, dts[i] - pts[i]);
     return max / timescale;
   }
 
   /**
-   * Émet un fragment quand assez de données sont accumulées.
+   * Emits a fragment once enough data has accumulated.
    *
-   * On coupe sur une image CLÉ : un fragment qui commencerait au milieu d'un
-   * groupe d'images serait indécodable seul, et casserait le seek.
+   * The cut happens on a KEY frame: a fragment starting mid-group-of-pictures
+   * would be undecodable on its own, and would break seeking.
    */
-  private vider(forcer: boolean) {
-    const pisteRef = this.video ?? this.audio;
-    if (!pisteRef) return;
-    const fileRef = this.tampons.get(pisteRef.piste.numero);
-    if (!fileRef || fileRef.length === 0) return;
+  private flush(force: boolean) {
+    const refTrack = this.video ?? this.audio;
+    if (!refTrack) return;
+    const refQueue = this.buffers.get(refTrack.track.number);
+    if (!refQueue || refQueue.length === 0) return;
 
-    let coupe = fileRef.length;
-    if (!forcer) {
-      // Dernière image clé qui laisse assez de matière derrière elle.
-      coupe = -1;
-      for (let i = fileRef.length - 1; i > 0; i--) {
-        const estCle = this.video ? fileRef[i].keyframe : true;
-        if (!estCle) continue;
-        if (fileRef[i].timestamp - fileRef[0].timestamp >= this.dureeFragmentTicks) {
-          coupe = i;
+    let cut = refQueue.length;
+    if (!force) {
+      // Last key frame that leaves enough material behind it.
+      cut = -1;
+      for (let i = refQueue.length - 1; i > 0; i--) {
+        const isKey = this.video ? refQueue[i].keyframe : true;
+        if (!isKey) continue;
+        if (refQueue[i].timestamp - refQueue[0].timestamp >= this.fragmentDurationTicks) {
+          cut = i;
           break;
         }
       }
-      if (coupe <= 0) return; // pas encore assez, ou aucune image clé
+      if (cut <= 0) return; // not enough yet, or no key frame
     }
 
-    const finTicks = coupe < fileRef.length ? fileRef[coupe].timestamp : Infinity;
+    const endTicks = cut < refQueue.length ? refQueue[cut].timestamp : Infinity;
 
-    // On prélève d'abord, on prépare ensuite : le décalage de présentation se
-    // calcule sur la vidéo et doit s'appliquer à l'audio du MÊME fragment.
-    const lots: { mux: PisteMux; pris: Echantillon[]; suivant?: Echantillon }[] = [];
-    for (const [numero, file] of this.tampons) {
-      const mux = this.cibleDe(numero);
+    // Samples are taken first, prepared afterward: the presentation offset
+    // is computed from the video and must apply to the audio of the SAME fragment.
+    const batches: { mux: MuxTrack; taken: Sample[]; next?: Sample }[] = [];
+    for (const [trackNumber, queue] of this.buffers) {
+      const mux = this.targetFor(trackNumber);
       if (!mux) continue;
 
-      // On ne prend que ce qui précède la coupe : l'audio d'après part au fragment
-      // suivant, sinon les pistes se désynchronisent d'un fragment.
-      const pris: Echantillon[] = [];
-      while (file.length > 0 && (forcer || file[0].timestamp < finTicks)) {
-        pris.push(file.shift()!);
+      // Only what precedes the cut is taken: audio after it goes to the
+      // next fragment, otherwise the tracks drift out of sync by one fragment.
+      const taken: Sample[] = [];
+      while (queue.length > 0 && (force || queue[0].timestamp < endTicks)) {
+        taken.push(queue.shift()!);
       }
-      if (pris.length > 0) lots.push({ mux, pris, suivant: file[0] });
+      if (taken.length > 0) batches.push({ mux, taken, next: queue[0] });
     }
-    if (lots.length === 0) return;
+    if (batches.length === 0) return;
 
-    // Le décalage est fixé UNE fois, sur le premier lot vidéo, et vaut ensuite
-    // pour tout le fichier : le recalculer par fragment ferait sauter l'horloge.
-    if (this.decalageSecondes === null) {
-      const lotVideo = lots.find((l) => l.mux.description.type === "video");
-      if (lotVideo) {
-        const ts = lotVideo.mux.description.timescale;
-        const pts = lotVideo.pris.map((e) => this.convertir(e.timestamp, ts));
-        this.decalageSecondes = this.delaiReordre(pts, reconstruireDts(pts), ts);
+    // The offset is fixed ONCE, from the first video batch, and then holds
+    // for the whole file: recomputing it per fragment would make the clock jump.
+    if (this.presentationOffsetSeconds === null) {
+      const videoBatch = batches.find((b) => b.mux.description.type === "video");
+      if (videoBatch) {
+        const ts = videoBatch.mux.description.timescale;
+        const pts = videoBatch.taken.map((s) => this.convert(s.timestamp, ts));
+        this.presentationOffsetSeconds = this.reorderDelay(pts, reconstructDts(pts), ts);
       } else {
-        this.decalageSecondes = 0; // audio seul : rien à réordonner
+        this.presentationOffsetSeconds = 0; // audio only: nothing to reorder
       }
     }
 
-    const fragments: FragmentPiste[] = lots.map((l) => ({
-      piste: l.mux,
-      echantillons: this.preparer(l.pris, l.mux, l.suivant),
+    const fragments: TrackFragment[] = batches.map((b) => ({
+      track: b.mux,
+      samples: this.prepare(b.taken, b.mux, b.next),
     }));
 
-    const segment = segmentMedia(this.sequence++, fragments);
+    const segment = mediaSegment(this.sequence++, fragments);
     if (segment.length > 0) this.opt.onSegment?.(segment);
   }
 
-  /** Convertit les timestamps, reconstruit les DTS et calcule les durées. */
-  private preparer(
-    echantillons: Echantillon[],
-    mux: PisteMux,
-    suivant: Echantillon | undefined,
-  ): EchantillonMux[] {
+  /** Converts timestamps, reconstructs DTS, and computes durations. */
+  private prepare(
+    samples: Sample[],
+    mux: MuxTrack,
+    next: Sample | undefined,
+  ): MuxSample[] {
     const ts = mux.description.timescale;
-    const pts = echantillons.map((e) => this.convertir(e.timestamp, ts));
-    const dts = reconstruireDts(pts);
+    const pts = samples.map((s) => this.convert(s.timestamp, ts));
+    const dts = reconstructDts(pts);
 
-    // Décalage commun aux deux pistes, converti dans l'horloge de celle-ci.
-    const decalage = Math.round((this.decalageSecondes ?? 0) * ts);
-    for (let i = 0; i < pts.length; i++) pts[i] += decalage;
-    // L'audio n'a pas d'images B : son DTS suit son PTS, décalage compris. La
-    // vidéo garde un DTS qui démarre à zéro — c'est tout l'objet du décalage.
+    // Offset shared by both tracks, converted into this track's clock.
+    const offset = Math.round((this.presentationOffsetSeconds ?? 0) * ts);
+    for (let i = 0; i < pts.length; i++) pts[i] += offset;
+    // Audio has no B-frames: its DTS follows its PTS, offset included. Video
+    // keeps a DTS that starts at zero — that's the whole point of the offset.
     if (mux.description.type === "audio") {
-      for (let i = 0; i < dts.length; i++) dts[i] += decalage;
+      for (let i = 0; i < dts.length; i++) dts[i] += offset;
     }
 
-    return echantillons.map((e, i) => {
-      // Durée = écart jusqu'au DTS suivant. Pour le dernier échantillon du
-      // fragment on regarde la trame d'après, restée en tampon ; à défaut on
-      // reprend l'écart précédent, faute de mieux.
-      let duree: number;
+    return samples.map((s, i) => {
+      // Duration = gap to the next DTS. For the fragment's last sample, the
+      // next frame (still buffered) is used; failing that, the previous gap
+      // is reused for lack of anything better.
+      let duration: number;
       if (i + 1 < dts.length) {
-        duree = dts[i + 1] - dts[i];
-      } else if (suivant) {
-        duree = Math.max(1, this.convertir(suivant.timestamp, ts) - dts[i]);
-      } else if (e.duree) {
-        duree = this.convertir(e.duree, ts);
+        duration = dts[i + 1] - dts[i];
+      } else if (next) {
+        duration = Math.max(1, this.convert(next.timestamp, ts) - dts[i]);
+      } else if (s.duration) {
+        duration = this.convert(s.duration, ts);
       } else if (dts.length >= 2) {
-        duree = dts[dts.length - 1] - dts[dts.length - 2];
+        duration = dts[dts.length - 1] - dts[dts.length - 2];
       } else {
-        duree = Math.round(ts / 25); // dernier recours : 25 i/s
+        duration = Math.round(ts / 25); // last resort: 25 fps
       }
 
       return {
         pts: pts[i],
         dts: dts[i],
-        duree: Math.max(0, duree),
-        keyframe: mux.description.type === "audio" ? true : e.keyframe,
-        donnees: e.donnees,
+        duration: Math.max(0, duration),
+        keyframe: mux.description.type === "audio" ? true : s.keyframe,
+        data: s.data,
       };
     });
   }
 }
 
-function description(choix: PisteChoisie): string {
-  return choix.description.codec;
+function codecLabel(choice: ChosenTrack): string {
+  return choice.description.codec;
 }

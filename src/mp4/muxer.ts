@@ -1,290 +1,291 @@
-import { boite, joindre, pleine, u16, u32, u64, u8, fourcc } from "./box.js";
+import { box, concat, full, u16, u32, u64, u8, fourcc } from "./box.js";
 import type { Description } from "../codecs/index.js";
 
 /**
- * Écriture de fMP4 (MP4 fragmenté) pour MediaSource.
+ * Writing fMP4 (fragmented MP4) for MediaSource.
  *
- * Un flux MSE se compose de deux choses :
- *   - un **segment d'initialisation** : `ftyp` + `moov`, décrit les pistes ;
- *   - des **segments média** : `moof` + `mdat`, portent les échantillons.
- * Le `moov` doit contenir un `mvex`/`trex`, sans quoi le navigateur lit le film
- * comme un MP4 classique et attend une table d'échantillons qui n'existe pas.
+ * An MSE stream is made of two things:
+ *   - an **init segment**: `ftyp` + `moov`, describing the tracks;
+ *   - **media segments**: `moof` + `mdat`, carrying the samples.
+ * The `moov` must contain an `mvex`/`trex`, or the browser reads the movie
+ * as a plain MP4 and waits for a sample table that doesn't exist.
  */
 
-export type PisteMux = {
-  /** Identifiant MP4 (1-based, indépendant du numéro Matroska). */
+export type MuxTrack = {
+  /** MP4 identifier (1-based, independent of the Matroska track number). */
   id: number;
   description: Description;
 };
 
-export type EchantillonMux = {
-  /** Présentation, dans le timescale de la piste. */
+export type MuxSample = {
+  /** Presentation, in the track's timescale. */
   pts: number;
-  /** Décodage, dans le timescale de la piste. */
+  /** Decode, in the track's timescale. */
   dts: number;
-  duree: number;
+  duration: number;
   keyframe: boolean;
-  donnees: Uint8Array;
+  data: Uint8Array;
 };
 
-/** Timescale du film : 1 ms, lisible et suffisant pour l'entête. */
-const TIMESCALE_FILM = 1000;
+/** Movie timescale: 1 ms, readable and good enough for the header. */
+const MOVIE_TIMESCALE = 1000;
 
-const MATRICE_IDENTITE = [
+const IDENTITY_MATRIX = [
   ...u32(0x00010000), ...u32(0), ...u32(0),
   ...u32(0), ...u32(0x00010000), ...u32(0),
   ...u32(0), ...u32(0), ...u32(0x40000000),
 ];
 
-function mvhd(dureeMs: number): Uint8Array {
-  return boite(
+function mvhd(durationMs: number): Uint8Array {
+  return box(
     "mvhd",
-    pleine(0, 0),
+    full(0, 0),
     u32(0), // creation_time
     u32(0), // modification_time
-    u32(TIMESCALE_FILM),
-    u32(Math.max(0, Math.round(dureeMs))),
+    u32(MOVIE_TIMESCALE),
+    u32(Math.max(0, Math.round(durationMs))),
     u32(0x00010000), // rate 1.0
     u16(0x0100), // volume 1.0
     u16(0), // reserved
     u32(0),
     u32(0), // reserved
-    MATRICE_IDENTITE,
+    IDENTITY_MATRIX,
     u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), // pre_defined
-    // next_track_ID : 0xffffffff dit « je ne sais pas », ce qui est vrai en fragmenté.
+    // next_track_ID: 0xffffffff means "unknown", which is true in fragmented MP4.
     u32(0xffffffff),
   );
 }
 
-function tkhd(piste: PisteMux, dureeMs: number): Uint8Array {
-  const estVideo = piste.description.type === "video";
-  // Dimensions en 16.16, relues dans l'entrée d'échantillon (offsets fixes).
-  const largeur = estVideo ? lireU16(piste.description.entree, 32) : 0;
-  const hauteur = estVideo ? lireU16(piste.description.entree, 34) : 0;
+function tkhd(track: MuxTrack, durationMs: number): Uint8Array {
+  const isVideo = track.description.type === "video";
+  // Dimensions in 16.16, read back from the sample entry (fixed offsets).
+  const width = isVideo ? readU16(track.description.entry, 32) : 0;
+  const height = isVideo ? readU16(track.description.entry, 34) : 0;
 
-  return boite(
+  return box(
     "tkhd",
-    pleine(0, 0x000007), // enabled | in_movie | in_preview
+    full(0, 0x000007), // enabled | in_movie | in_preview
     u32(0),
     u32(0),
-    u32(piste.id),
+    u32(track.id),
     u32(0), // reserved
-    u32(Math.max(0, Math.round(dureeMs))),
+    u32(Math.max(0, Math.round(durationMs))),
     u32(0),
     u32(0), // reserved
     u16(0), // layer
     u16(0), // alternate_group
-    u16(estVideo ? 0 : 0x0100), // volume : 1.0 pour l'audio, 0 pour la vidéo
+    u16(isVideo ? 0 : 0x0100), // volume: 1.0 for audio, 0 for video
     u16(0), // reserved
-    MATRICE_IDENTITE,
-    u32(largeur << 16),
-    u32(hauteur << 16),
+    IDENTITY_MATRIX,
+    u32(width << 16),
+    u32(height << 16),
   );
 }
 
-function lireU16(buf: Uint8Array, offset: number): number {
+function readU16(buf: Uint8Array, offset: number): number {
   return (buf[offset] << 8) | buf[offset + 1];
 }
 
-function mdhd(timescale: number, dureeMs: number): Uint8Array {
-  return boite(
+function mdhd(timescale: number, durationMs: number): Uint8Array {
+  return box(
     "mdhd",
-    pleine(0, 0),
+    full(0, 0),
     u32(0),
     u32(0),
     u32(timescale),
-    u32(Math.max(0, Math.round((dureeMs / 1000) * timescale))),
-    // Langue « und » en code 5 bits par lettre : (u-0x60)<<10 | (n-0x60)<<5 | (d-0x60)
+    u32(Math.max(0, Math.round((durationMs / 1000) * timescale))),
+    // "und" language as 5-bit-per-letter code: (u-0x60)<<10 | (n-0x60)<<5 | (d-0x60)
     u16(0x55c4),
     u16(0), // pre_defined
   );
 }
 
 function hdlr(type: "video" | "audio"): Uint8Array {
-  return boite(
+  return box(
     "hdlr",
-    pleine(0, 0),
+    full(0, 0),
     u32(0), // pre_defined
     fourcc(type === "video" ? "vide" : "soun"),
     u32(0), u32(0), u32(0), // reserved
-    // Nom lisible, terminé par un zéro.
+    // Human-readable name, zero-terminated.
     new TextEncoder().encode(type === "video" ? "CinemuxVideo\0" : "CinemuxAudio\0"),
   );
 }
 
 function dinf(): Uint8Array {
-  // `dref` avec une `url ` auto-référente : les données sont dans ce fichier.
-  const url = boite("url ", pleine(0, 0x000001));
-  return boite("dinf", boite("dref", pleine(0, 0), u32(1), url));
+  // `dref` with a self-referencing `url `: the data lives in this same file.
+  const url = box("url ", full(0, 0x000001));
+  return box("dinf", box("dref", full(0, 0), u32(1), url));
 }
 
-function stbl(entree: Uint8Array): Uint8Array {
-  return boite(
+function stbl(entry: Uint8Array): Uint8Array {
+  return box(
     "stbl",
-    boite("stsd", pleine(0, 0), u32(1), entree),
-    // Tables vides : en fragmenté, tout est décrit dans les `trun`.
-    boite("stts", pleine(0, 0), u32(0)),
-    boite("stsc", pleine(0, 0), u32(0)),
-    boite("stsz", pleine(0, 0), u32(0), u32(0)),
-    boite("stco", pleine(0, 0), u32(0)),
+    box("stsd", full(0, 0), u32(1), entry),
+    // Empty tables: in fragmented MP4, everything is described in the `trun`s.
+    box("stts", full(0, 0), u32(0)),
+    box("stsc", full(0, 0), u32(0)),
+    box("stsz", full(0, 0), u32(0), u32(0)),
+    box("stco", full(0, 0), u32(0)),
   );
 }
 
-function trak(piste: PisteMux, dureeMs: number): Uint8Array {
-  const d = piste.description;
-  const entete = d.type === "video"
-    ? boite("vmhd", pleine(0, 1), u16(0), u16(0), u16(0), u16(0))
-    : boite("smhd", pleine(0, 0), u16(0), u16(0));
+function trak(track: MuxTrack, durationMs: number): Uint8Array {
+  const d = track.description;
+  const header = d.type === "video"
+    ? box("vmhd", full(0, 1), u16(0), u16(0), u16(0), u16(0))
+    : box("smhd", full(0, 0), u16(0), u16(0));
 
-  return boite(
+  return box(
     "trak",
-    tkhd(piste, dureeMs),
-    boite(
+    tkhd(track, durationMs),
+    box(
       "mdia",
-      mdhd(d.timescale, dureeMs),
+      mdhd(d.timescale, durationMs),
       hdlr(d.type),
-      boite("minf", entete, dinf(), stbl(d.entree)),
+      box("minf", header, dinf(), stbl(d.entry)),
     ),
   );
 }
 
-function mvex(pistes: PisteMux[]): Uint8Array {
-  const trexs = pistes.map((p) =>
-    boite(
+function mvex(tracks: MuxTrack[]): Uint8Array {
+  const trexs = tracks.map((t) =>
+    box(
       "trex",
-      pleine(0, 0),
-      u32(p.id),
+      full(0, 0),
+      u32(t.id),
       u32(1), // default_sample_description_index
       u32(0), // default_sample_duration
       u32(0), // default_sample_size
       u32(0), // default_sample_flags
     ),
   );
-  return boite("mvex", ...trexs);
+  return box("mvex", ...trexs);
 }
 
 /**
- * Segment d'initialisation : `ftyp` + `moov`.
- * `iso6` dans les marques de compatibilité : c'est ce que réclament les
- * implémentations MSE pour accepter du fragmenté.
+ * Init segment: `ftyp` + `moov`.
+ * `iso6` in the compatibility brands: MSE implementations require it to
+ * accept fragmented MP4.
  */
-export function segmentInit(pistes: PisteMux[], dureeMs = 0): Uint8Array {
-  const ftyp = boite("ftyp", fourcc("isom"), u32(0x200), fourcc("isom"), fourcc("iso2"), fourcc("iso6"), fourcc("mp41"));
-  const moov = boite("moov", mvhd(dureeMs), ...pistes.map((p) => trak(p, dureeMs)), mvex(pistes));
-  return joindre(ftyp, moov);
+export function segmentInit(tracks: MuxTrack[], durationMs = 0): Uint8Array {
+  const ftyp = box("ftyp", fourcc("isom"), u32(0x200), fourcc("isom"), fourcc("iso2"), fourcc("iso6"), fourcc("mp41"));
+  const moov = box("moov", mvhd(durationMs), ...tracks.map((t) => trak(t, durationMs)), mvex(tracks));
+  return concat(ftyp, moov);
 }
 
 // ---------------------------------------------------------------------------
-// Segments média
+// Media segments
 // ---------------------------------------------------------------------------
 
-/** Drapeaux `trun` : offset de données, puis durée/taille/flags/décalage CTS par échantillon. */
+/** `trun` flags: data-offset, then per-sample duration/size/flags/CTS-offset. */
 const TRUN_FLAGS = 0x000001 | 0x000100 | 0x000200 | 0x000400 | 0x000800;
 
-/** Un échantillon non-clé dépend d'autres images : le dire évite un décodage à contresens. */
-const FLAGS_ECHANTILLON_CLE = 0x02000000;
-const FLAGS_ECHANTILLON_NON_CLE = 0x01010000;
+/** A non-key sample depends on other frames: flagging it avoids decoding against the grain. */
+const KEY_SAMPLE_FLAGS = 0x02000000;
+const NON_KEY_SAMPLE_FLAGS = 0x01010000;
 
-export type FragmentPiste = {
-  piste: PisteMux;
-  echantillons: EchantillonMux[];
+export type TrackFragment = {
+  track: MuxTrack;
+  samples: MuxSample[];
 };
 
 /**
- * Segment média : un `moof` puis un `mdat` unique.
+ * Media segment: a single `moof` followed by a single `mdat`.
  *
- * Toutes les pistes du fragment partagent le `mdat` : c'est ce qu'attendent les
- * implémentations MSE, et ça évite un segment par piste (donc deux SourceBuffer
- * à synchroniser à la main).
+ * Every track in the fragment shares the `mdat`: this is what MSE
+ * implementations expect, and it avoids one segment per track (so two
+ * SourceBuffers to hand-sync).
  */
-export function segmentMedia(numeroSequence: number, fragments: FragmentPiste[]): Uint8Array {
-  const utiles = fragments.filter((f) => f.echantillons.length > 0);
-  if (utiles.length === 0) return new Uint8Array(0);
+export function mediaSegment(sequenceNumber: number, fragments: TrackFragment[]): Uint8Array {
+  const usable = fragments.filter((f) => f.samples.length > 0);
+  if (usable.length === 0) return new Uint8Array(0);
 
-  const mfhd = boite("mfhd", pleine(0, 0), u32(numeroSequence));
+  const mfhd = box("mfhd", full(0, 0), u32(sequenceNumber));
 
-  // Le `data_offset` d'un `trun` se compte depuis le début du `moof`. Or il faut
-  // connaître la taille du `moof` pour l'écrire… qui dépend des `trun`. On écrit
-  // donc une première fois avec 0, on mesure, puis on réécrit.
-  const construire = (offsetsData: number[]): Uint8Array => {
-    const trafs = utiles.map((f, i) => traf(f, offsetsData[i]));
-    return boite("moof", mfhd, ...trafs);
+  // A `trun`'s `data_offset` is counted from the start of the `moof`. But
+  // writing the `moof` requires knowing its size… which depends on the
+  // `trun`s. So it's built once with 0, measured, then rebuilt.
+  const build = (dataOffsets: number[]): Uint8Array => {
+    const trafs = usable.map((f, i) => traf(f, dataOffsets[i]));
+    return box("moof", mfhd, ...trafs);
   };
 
-  const provisoire = construire(utiles.map(() => 0));
-  const tailleMoof = provisoire.length;
+  const draft = build(usable.map(() => 0));
+  const moofSize = draft.length;
 
-  // Chaque piste commence là où finit la précédente dans le `mdat`.
+  // Each track starts where the previous one ends in the `mdat`.
   const offsets: number[] = [];
-  let curseur = tailleMoof + 8; // + en-tête du mdat
-  for (const f of utiles) {
-    offsets.push(curseur);
-    for (const e of f.echantillons) curseur += e.donnees.length;
+  let cursor = moofSize + 8; // + mdat header
+  for (const f of usable) {
+    offsets.push(cursor);
+    for (const s of f.samples) cursor += s.data.length;
   }
 
-  const moof = construire(offsets);
-  // Garde-fou : si la taille a bougé, les offsets sont faux et l'image se corromprait
-  // silencieusement. Mieux vaut échouer bruyamment.
-  if (moof.length !== tailleMoof) {
-    throw new Error("taille du moof instable — offsets de données invalides");
+  const moof = build(offsets);
+  // Safety net: if the size moved, the offsets are wrong and the picture
+  // would silently corrupt. Better to fail loudly.
+  if (moof.length !== moofSize) {
+    throw new Error("unstable moof size — invalid data offsets");
   }
 
-  const donnees: Uint8Array[] = [];
-  for (const f of utiles) for (const e of f.echantillons) donnees.push(e.donnees);
-  return joindre(moof, boite("mdat", ...donnees));
+  const dataChunks: Uint8Array[] = [];
+  for (const f of usable) for (const s of f.samples) dataChunks.push(s.data);
+  return concat(moof, box("mdat", ...dataChunks));
 }
 
-function traf(f: FragmentPiste, offsetData: number): Uint8Array {
-  const premier = f.echantillons[0];
+function traf(f: TrackFragment, dataOffset: number): Uint8Array {
+  const first = f.samples[0];
 
-  const tfhd = boite(
+  const tfhd = box(
     "tfhd",
-    // 0x020000 = default-base-is-moof : les offsets partent du `moof`, pas du
-    // fichier. Indispensable, on ne connaît pas notre position absolue.
-    pleine(0, 0x020000),
-    u32(f.piste.id),
+    // 0x020000 = default-base-is-moof: offsets are relative to the `moof`,
+    // not the file. Required, since we don't know our absolute position.
+    full(0, 0x020000),
+    u32(f.track.id),
   );
 
-  // Version 1 : baseMediaDecodeTime sur 64 bits. Un film de 3 h en 90 kHz fait
-  // 972 millions de ticks — ça tient sur 32 bits, mais pas un concert de 6 h en
-  // 48 kHz cumulé. Le 64 bits coûte 4 octets par fragment, on ne discute pas.
-  const tfdt = boite("tfdt", pleine(1, 0), u64(Math.max(0, premier.dts)));
+  // Version 1: 64-bit baseMediaDecodeTime. A 3-hour movie at 90 kHz is 972
+  // million ticks — that fits in 32 bits, but not a 6-hour concert at
+  // 48 kHz cumulated. The 64-bit cost is 4 bytes per fragment; not worth
+  // arguing over.
+  const tfdt = box("tfdt", full(1, 0), u64(Math.max(0, first.dts)));
 
-  const entrees: number[] = [];
-  for (const e of f.echantillons) {
-    entrees.push(
-      ...u32(e.duree),
-      ...u32(e.donnees.length),
-      ...u32(e.keyframe ? FLAGS_ECHANTILLON_CLE : FLAGS_ECHANTILLON_NON_CLE),
-      // Décalage CTS signé (version 1) : PTS - DTS. Nul sans images B.
-      ...u32(e.pts - e.dts),
+  const entries: number[] = [];
+  for (const s of f.samples) {
+    entries.push(
+      ...u32(s.duration),
+      ...u32(s.data.length),
+      ...u32(s.keyframe ? KEY_SAMPLE_FLAGS : NON_KEY_SAMPLE_FLAGS),
+      // Signed CTS offset (version 1): PTS - DTS. Zero without B-frames.
+      ...u32(s.pts - s.dts),
     );
   }
 
-  const trun = boite(
+  const trun = box(
     "trun",
-    pleine(1, TRUN_FLAGS),
-    u32(f.echantillons.length),
-    u32(offsetData),
-    entrees,
+    full(1, TRUN_FLAGS),
+    u32(f.samples.length),
+    u32(dataOffset),
+    entries,
   );
 
-  return boite("traf", tfhd, tfdt, trun);
+  return box("traf", tfhd, tfdt, trun);
 }
 
 /**
- * Reconstruit les DTS à partir des seuls PTS.
+ * Reconstructs DTS from PTS alone.
  *
- * POURQUOI — Matroska ne stocke QUE des timestamps de présentation, alors que
- * MP4 exige des timestamps de décodage plus un décalage. Avec des images B, les
- * deux diffèrent : poser DTS = PTS ferait afficher les images dans l'ordre de
- * décodage, soit une saccade permanente sur tout encodage moderne.
+ * WHY — Matroska stores ONLY presentation timestamps, while MP4 requires
+ * decode timestamps plus an offset. With B-frames, the two differ: setting
+ * DTS = PTS would display frames in decode order, a permanent stutter on
+ * any modern encoding.
  *
- * L'astuce : sur un groupe d'images fermé, l'ENSEMBLE des PTS égale l'ensemble
- * des DTS — seul l'ordre change. Les PTS triés, réattribués dans l'ordre de
- * décodage, donnent donc des DTS croissants et exacts.
+ * The trick: within a closed group of pictures, the SET of PTS equals the
+ * SET of DTS — only the order changes. Sorting the PTS and reassigning them
+ * in decode order therefore yields exact, increasing DTS values.
  */
-export function reconstruireDts(ptsOrdreDecodage: number[]): number[] {
-  const tries = [...ptsOrdreDecodage].sort((a, b) => a - b);
-  return tries;
+export function reconstructDts(ptsDecodeOrder: number[]): number[] {
+  const sorted = [...ptsDecodeOrder].sort((a, b) => a - b);
+  return sorted;
 }

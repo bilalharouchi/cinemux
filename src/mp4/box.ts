@@ -1,48 +1,48 @@
 /**
- * Écriture de boîtes ISO BMFF (« atomes » MP4).
+ * Writing ISO BMFF boxes (MP4 "atoms").
  *
- * Une boîte, c'est : taille sur 4 octets, type sur 4 octets ASCII, puis le
- * contenu — éventuellement d'autres boîtes. Tout est gros-boutiste.
+ * A box is: 4-byte size, 4-byte ASCII type, then the content — possibly
+ * more boxes. Everything is big-endian.
  */
 
-export type Contenu = Uint8Array | number[];
+export type Content = Uint8Array | number[];
 
-const encodeur = new TextEncoder();
+const encoder = new TextEncoder();
 
-/** Concatène des morceaux en un seul tampon. */
-export function joindre(...morceaux: Contenu[]): Uint8Array {
+/** Concatenates chunks into a single buffer. */
+export function concat(...chunks: Content[]): Uint8Array {
   let total = 0;
-  for (const m of morceaux) total += m.length;
-  const sortie = new Uint8Array(total);
+  for (const c of chunks) total += c.length;
+  const output = new Uint8Array(total);
   let pos = 0;
-  for (const m of morceaux) {
-    sortie.set(m instanceof Uint8Array ? m : new Uint8Array(m), pos);
-    pos += m.length;
-  }
-  return sortie;
-}
-
-/** Fabrique une boîte : `[taille][type][contenu…]`. */
-export function boite(type: string, ...contenu: Contenu[]): Uint8Array {
-  let taille = 8;
-  for (const c of contenu) taille += c.length;
-
-  const sortie = new Uint8Array(taille);
-  sortie[0] = (taille >>> 24) & 0xff;
-  sortie[1] = (taille >>> 16) & 0xff;
-  sortie[2] = (taille >>> 8) & 0xff;
-  sortie[3] = taille & 0xff;
-  sortie.set(encodeur.encode(type), 4);
-
-  let pos = 8;
-  for (const c of contenu) {
-    sortie.set(c instanceof Uint8Array ? c : new Uint8Array(c), pos);
+  for (const c of chunks) {
+    output.set(c instanceof Uint8Array ? c : new Uint8Array(c), pos);
     pos += c.length;
   }
-  return sortie;
+  return output;
 }
 
-/** Entier non signé 32 bits, gros-boutiste. */
+/** Builds a box: `[size][type][content…]`. */
+export function box(type: string, ...content: Content[]): Uint8Array {
+  let size = 8;
+  for (const c of content) size += c.length;
+
+  const output = new Uint8Array(size);
+  output[0] = (size >>> 24) & 0xff;
+  output[1] = (size >>> 16) & 0xff;
+  output[2] = (size >>> 8) & 0xff;
+  output[3] = size & 0xff;
+  output.set(encoder.encode(type), 4);
+
+  let pos = 8;
+  for (const c of content) {
+    output.set(c instanceof Uint8Array ? c : new Uint8Array(c), pos);
+    pos += c.length;
+  }
+  return output;
+}
+
+/** 32-bit unsigned integer, big-endian. */
 export function u32(v: number): number[] {
   return [(v >>> 24) & 0xff, (v >>> 16) & 0xff, (v >>> 8) & 0xff, v & 0xff];
 }
@@ -56,46 +56,46 @@ export function u8(v: number): number[] {
 }
 
 /**
- * Entier 64 bits.
+ * 64-bit integer.
  *
- * Écrit en deux moitiés de 32 bits plutôt que via BigInt : les `tfdt` d'un film
- * de 3 h dépassent 2^32 en ticks de 90 kHz, mais restent très loin de 2^53, où
- * `Number` perd son exactitude.
+ * Written as two 32-bit halves instead of via BigInt: a 3-hour movie's
+ * `tfdt` values exceed 2^32 in 90 kHz ticks, but stay far below 2^53, where
+ * `Number` loses exactness.
  */
 export function u64(v: number): number[] {
-  const haut = Math.floor(v / 0x100000000);
-  const bas = v % 0x100000000;
-  return [...u32(haut), ...u32(bas >>> 0)];
+  const high = Math.floor(v / 0x100000000);
+  const low = v % 0x100000000;
+  return [...u32(high), ...u32(low >>> 0)];
 }
 
-/** Entête d'une « full box » : version sur 1 octet + flags sur 3. */
-export function pleine(version: number, flags: number): number[] {
+/** Header of a "full box": 1-byte version + 3-byte flags. */
+export function full(version: number, flags: number): number[] {
   return [version & 0xff, (flags >>> 16) & 0xff, (flags >>> 8) & 0xff, flags & 0xff];
 }
 
-/** Chaîne ASCII de 4 caractères (types de boîte, marques de compatibilité). */
+/** 4-character ASCII string (box types, compatibility brands). */
 export function fourcc(s: string): Uint8Array {
-  return encodeur.encode(s.padEnd(4, " ").slice(0, 4));
+  return encoder.encode(s.padEnd(4, " ").slice(0, 4));
 }
 
 /**
- * Longueur au format « descripteur MPEG-4 » : 7 bits utiles par octet, le bit de
- * poids fort indiquant qu'un octet suit. Sert aux `esds` de l'AAC.
+ * Length in "MPEG-4 descriptor" format: 7 usable bits per byte, the
+ * high bit signaling that another byte follows. Used by AAC's `esds`.
  */
-export function longueurDescripteur(taille: number): number[] {
-  const octets: number[] = [];
-  let reste = taille;
+export function descriptorLength(size: number): number[] {
+  const bytes: number[] = [];
+  let remaining = size;
   do {
-    octets.unshift(reste & 0x7f);
-    reste >>>= 7;
-  } while (reste > 0);
-  for (let i = 0; i < octets.length - 1; i++) octets[i] |= 0x80;
-  return octets;
+    bytes.unshift(remaining & 0x7f);
+    remaining >>>= 7;
+  } while (remaining > 0);
+  for (let i = 0; i < bytes.length - 1; i++) bytes[i] |= 0x80;
+  return bytes;
 }
 
-/** Descripteur MPEG-4 : `[tag][longueur][contenu]`. */
-export function descripteur(tag: number, ...contenu: Contenu[]): Uint8Array {
-  let taille = 0;
-  for (const c of contenu) taille += c.length;
-  return joindre([tag], longueurDescripteur(taille), ...contenu);
+/** MPEG-4 descriptor: `[tag][length][content]`. */
+export function descriptor(tag: number, ...content: Content[]): Uint8Array {
+  let size = 0;
+  for (const c of content) size += c.length;
+  return concat([tag], descriptorLength(size), ...content);
 }

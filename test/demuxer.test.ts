@@ -1,129 +1,129 @@
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
-import { MatroskaDemuxer, type Echantillon, type Piste } from "../src/matroska/demuxer.js";
+import { MatroskaDemuxer, type Sample, type Track } from "../src/matroska/demuxer.js";
 import { TrackType } from "../src/ebml/ids.js";
 
 /**
- * Les fixtures sont produites par ffmpeg (voir test/fixtures/README.md) : ce sont
- * de vrais MKV écrits par un vrai muxer, pas des octets fabriqués à la main. Un
- * parseur qui ne passe que sur ses propres fichiers de test ne prouve rien.
+ * The fixtures are produced by ffmpeg (see test/fixtures/README.md): they're
+ * real MKVs written by a real muxer, not hand-fabricated bytes. A parser
+ * that only passes on its own test files proves nothing.
  */
-function lire(nom: string): Uint8Array {
-  return new Uint8Array(readFileSync(new URL(`./fixtures/${nom}`, import.meta.url)));
+function readFixture(name: string): Uint8Array {
+  return new Uint8Array(readFileSync(new URL(`./fixtures/${name}`, import.meta.url)));
 }
 
-/** Démultiplexe en un seul morceau. */
-function demuxer(nom: string) {
-  const pistes: Piste[] = [];
-  const echantillons: Echantillon[] = [];
+/** Demuxes in a single chunk. */
+function demux(name: string) {
+  const tracks: Track[] = [];
+  const samples: Sample[] = [];
   const d = new MatroskaDemuxer({
-    onPistes: (p) => pistes.push(...p),
-    onEchantillon: (e) => echantillons.push(e),
+    onTracks: (t) => tracks.push(...t),
+    onSample: (e) => samples.push(e),
   });
-  d.alimenter(lire(nom));
-  return { d, pistes, echantillons };
+  d.feed(readFixture(name));
+  return { d, tracks, samples };
 }
 
-describe("démultiplexeur Matroska", () => {
-  it("lit l'échelle de temps et la durée", () => {
-    const { d } = demuxer("h264-aac.mkv");
-    // ffmpeg écrit 1 ms par tick, la valeur par défaut de la spec.
+describe("Matroska demuxer", () => {
+  it("reads the timestamp scale and duration", () => {
+    const { d } = demux("h264-aac.mkv");
+    // ffmpeg writes 1 ms per tick, the spec's default.
     expect(d.timestampScale).toBe(1_000_000);
-    expect(d.dureeMs).toBeGreaterThan(2900);
-    expect(d.dureeMs).toBeLessThan(3200);
+    expect(d.durationMs).toBeGreaterThan(2900);
+    expect(d.durationMs).toBeLessThan(3200);
   });
 
-  it("trouve les deux pistes et leurs codecs", () => {
-    const { pistes } = demuxer("h264-aac.mkv");
-    expect(pistes).toHaveLength(2);
+  it("finds both tracks and their codecs", () => {
+    const { tracks } = demux("h264-aac.mkv");
+    expect(tracks).toHaveLength(2);
 
-    const video = pistes.find((p) => p.type === TrackType.VIDEO)!;
+    const video = tracks.find((t) => t.type === TrackType.VIDEO)!;
     expect(video.codecId).toBe("V_MPEG4/ISO/AVC");
-    expect(video.video?.largeur).toBe(320);
-    expect(video.video?.hauteur).toBe(180);
-    // Sans avcC, impossible d'initialiser le décodeur : c'est éliminatoire.
+    expect(video.video?.width).toBe(320);
+    expect(video.video?.height).toBe(180);
+    // Without avcC, the decoder can't be initialized: this is disqualifying.
     expect(video.codecPrivate).not.toBeNull();
     expect(video.codecPrivate!.length).toBeGreaterThan(7);
 
-    const audio = pistes.find((p) => p.type === TrackType.AUDIO)!;
+    const audio = tracks.find((t) => t.type === TrackType.AUDIO)!;
     expect(audio.codecId).toBe("A_AAC");
-    expect(audio.audio?.frequence).toBe(44100);
-    expect(audio.audio?.canaux).toBe(1);
+    expect(audio.audio?.frequency).toBe(44100);
+    expect(audio.audio?.channels).toBe(1);
     expect(audio.codecPrivate).not.toBeNull(); // AudioSpecificConfig
   });
 
-  it("le CodecPrivate H.264 est bien un avcC", () => {
-    // C'est l'hypothèse qui rend le remux possible sans réécrire le bitstream :
-    // configurationVersion = 1, puis profil/compat/niveau.
-    const { pistes } = demuxer("h264-aac.mkv");
-    const avcC = pistes.find((p) => p.type === TrackType.VIDEO)!.codecPrivate!;
+  it("the H.264 CodecPrivate is indeed an avcC", () => {
+    // This is the assumption that makes remuxing possible without rewriting
+    // the bitstream: configurationVersion = 1, then profile/compat/level.
+    const { tracks } = demux("h264-aac.mkv");
+    const avcC = tracks.find((t) => t.type === TrackType.VIDEO)!.codecPrivate!;
     expect(avcC[0]).toBe(1);
-    // Les 2 bits de poids fort de l'octet 4 sont réservés à 1 (0xFC).
+    // The top 2 bits of byte 4 are reserved as 1 (0xFC).
     expect(avcC[4] & 0xfc).toBe(0xfc);
   });
 
-  it("extrait toutes les trames avec des timestamps croissants", () => {
-    const { echantillons } = demuxer("h264-aac.mkv");
-    // 3 s à 25 i/s = 75 trames vidéo, plus l'audio.
-    const video = echantillons.filter((e) => e.piste === 1);
+  it("extracts every frame with increasing timestamps", () => {
+    const { samples } = demux("h264-aac.mkv");
+    // 3s at 25fps = 75 video frames, plus audio.
+    const video = samples.filter((e) => e.track === 1);
     expect(video.length).toBeGreaterThanOrEqual(74);
 
-    // Le premier échantillon vidéo est forcément une image clé.
+    // The first video sample must be a keyframe.
     expect(video[0].keyframe).toBe(true);
 
-    // Ordre de décodage : les timestamps ne doivent jamais reculer.
+    // Decode order: timestamps must never go backwards.
     for (let i = 1; i < video.length; i++) {
       expect(video[i].timestamp).toBeGreaterThanOrEqual(video[i - 1].timestamp);
     }
   });
 
-  it("aucune trame vide ne sort du démultiplexeur", () => {
-    // Une trame de 0 octet passerait le typage et casserait le décodeur en aval.
-    const { echantillons } = demuxer("h264-aac.mkv");
-    expect(echantillons.length).toBeGreaterThan(0);
-    for (const e of echantillons) expect(e.donnees.length).toBeGreaterThan(0);
+  it("no empty frame ever comes out of the demuxer", () => {
+    // A 0-byte frame would pass the type system and break the downstream decoder.
+    const { samples } = demux("h264-aac.mkv");
+    expect(samples.length).toBeGreaterThan(0);
+    for (const e of samples) expect(e.data.length).toBeGreaterThan(0);
   });
 
-  it("le découpage en morceaux ne change rien au résultat", () => {
-    // C'est LE test qui compte pour le streaming : un élément coupé au milieu d'un
-    // morceau doit être remis à plus tard, pas perdu ni dupliqué.
-    const octets = lire("h264-aac.mkv");
-    const enUnBloc = demuxer("h264-aac.mkv").echantillons;
+  it("chunking doesn't change the result", () => {
+    // THE test that matters for streaming: an element split across a chunk
+    // boundary must be deferred, not lost or duplicated.
+    const bytes = readFixture("h264-aac.mkv");
+    const wholeFile = demux("h264-aac.mkv").samples;
 
-    for (const taille of [1, 7, 64, 1000, 65536]) {
-      const echantillons: Echantillon[] = [];
-      const d = new MatroskaDemuxer({ onEchantillon: (e) => echantillons.push(e) });
-      for (let i = 0; i < octets.length; i += taille) {
-        d.alimenter(octets.subarray(i, Math.min(i + taille, octets.length)));
+    for (const size of [1, 7, 64, 1000, 65536]) {
+      const samples: Sample[] = [];
+      const d = new MatroskaDemuxer({ onSample: (e) => samples.push(e) });
+      for (let i = 0; i < bytes.length; i += size) {
+        d.feed(bytes.subarray(i, Math.min(i + size, bytes.length)));
       }
-      expect(echantillons.length, `morceaux de ${taille} o`).toBe(enUnBloc.length);
-      expect(echantillons[0].donnees, `morceaux de ${taille} o`).toEqual(enUnBloc[0].donnees);
-      const dernier = echantillons.length - 1;
-      expect(echantillons[dernier].timestamp).toBe(enUnBloc[dernier].timestamp);
+      expect(samples.length, `${size}-byte chunks`).toBe(wholeFile.length);
+      expect(samples[0].data, `${size}-byte chunks`).toEqual(wholeFile[0].data);
+      const last = samples.length - 1;
+      expect(samples[last].timestamp).toBe(wholeFile[last].timestamp);
     }
   });
 
-  it("reconnaît l'AC3, qu'aucun navigateur ne décode", () => {
-    const { pistes } = demuxer("h264-ac3.mkv");
-    const audio = pistes.find((p) => p.type === TrackType.AUDIO)!;
+  it("recognizes AC3, which no browser decodes", () => {
+    const { tracks } = demux("h264-ac3.mkv");
+    const audio = tracks.find((t) => t.type === TrackType.AUDIO)!;
     expect(audio.codecId).toBe("A_AC3");
-    // La spec ne prévoit pas de CodecPrivate pour l'AC3 : tout est dans le flux.
+    // The spec doesn't provide a CodecPrivate for AC3: everything is in the stream.
     expect(audio.codecPrivate).toBeNull();
   });
 
-  it("voit les deux pistes audio d'un fichier multi-langue", () => {
-    const { pistes } = demuxer("h264-multi-audio.mkv");
-    const audio = pistes.filter((p) => p.type === TrackType.AUDIO);
+  it("sees both audio tracks of a multi-language file", () => {
+    const { tracks } = demux("h264-multi-audio.mkv");
+    const audio = tracks.filter((t) => t.type === TrackType.AUDIO);
     expect(audio).toHaveLength(2);
-    expect(audio.map((p) => p.codecId).sort()).toEqual(["A_AAC", "A_AC3"]);
+    expect(audio.map((t) => t.codecId).sort()).toEqual(["A_AAC", "A_AC3"]);
   });
 
-  it("collecte l'index de seek (Cues)", () => {
-    const { d } = demuxer("h264-aac.mkv");
+  it("collects the seek index (Cues)", () => {
+    const { d } = demux("h264-aac.mkv");
     expect(d.cues.length).toBeGreaterThan(0);
-    // Les positions sont relatives au Segment : on les a rendues absolues.
-    for (const c of d.cues) expect(c.positionCluster).toBeGreaterThan(0);
-    // Le premier point de seek est à zéro.
-    expect(d.cues[0].temps).toBe(0);
+    // Positions are relative to the Segment: we made them absolute.
+    for (const c of d.cues) expect(c.clusterPosition).toBeGreaterThan(0);
+    // The first seek point is at zero.
+    expect(d.cues[0].time).toBe(0);
   });
 });

@@ -1,95 +1,96 @@
 import { EbmlReader, UNKNOWN_SIZE } from "../ebml/reader.js";
 import { ID, MASTER_ELEMENTS, TrackType } from "../ebml/ids.js";
-import { decoderBloc } from "./blocks.js";
+import { decodeBlock } from "./blocks.js";
 
 /**
- * Démultiplexeur Matroska **en flux**.
+ * **Streaming** Matroska demuxer.
  *
- * Il est alimenté par morceaux (`alimenter`) et n'exige jamais le fichier entier :
- * c'est ce qui permet de commencer à jouer après quelques centaines de Ko, au lieu
- * d'attendre 3 Go. Un élément coupé au milieu d'un morceau est simplement remis à
- * plus tard — d'où le tampon interne et les `null` du lecteur.
+ * It's fed in chunks (`feed`) and never requires the whole file: this is
+ * what lets playback start after a few hundred KB, instead of waiting for
+ * 3 GB. An element cut off mid-chunk is simply deferred to later — hence the
+ * internal buffer and the reader's `null` returns.
  */
 
-export type PisteVideo = {
-  largeur: number;
-  hauteur: number;
-  largeurAffichee: number;
-  hauteurAffichee: number;
+export type VideoTrack = {
+  width: number;
+  height: number;
+  displayWidth: number;
+  displayHeight: number;
 };
 
-export type PisteAudio = {
-  frequence: number;
-  canaux: number;
+export type AudioTrack = {
+  frequency: number;
+  channels: number;
   bits: number | null;
 };
 
-export type Piste = {
-  numero: number;
+export type Track = {
+  number: number;
   type: number;
   codecId: string;
   codecPrivate: Uint8Array | null;
-  /** Nanosecondes par trame, quand le muxer l'a écrit. */
-  dureeParDefaut: number | null;
-  langue: string;
-  nom: string | null;
-  pardefaut: boolean;
-  forcee: boolean;
-  video: PisteVideo | null;
-  audio: PisteAudio | null;
-  /** Opus : décalage à retirer en début de piste (ns). */
+  /** Nanoseconds per frame, when the muxer wrote it. */
+  defaultDuration: number | null;
+  language: string;
+  name: string | null;
+  default: boolean;
+  forced: boolean;
+  video: VideoTrack | null;
+  audio: AudioTrack | null;
+  /** Opus: delay to strip at the start of the track (ns). */
   codecDelay: number | null;
 };
 
-export type Echantillon = {
-  piste: number;
-  /** En Track Ticks (× timestampScale pour obtenir des nanosecondes). */
+export type Sample = {
+  track: number;
+  /** In Track Ticks (× timestampScale to get nanoseconds). */
   timestamp: number;
-  /** Track Ticks, ou null si le muxer ne l'a pas écrit. */
-  duree: number | null;
+  /** Track Ticks, or null if the muxer didn't write it. */
+  duration: number | null;
   keyframe: boolean;
-  donnees: Uint8Array;
+  data: Uint8Array;
 };
 
-export type PointCue = {
+export type CuePoint = {
   /** Track Ticks. */
-  temps: number;
-  /** Position absolue du Cluster dans le fichier, relative au début du Segment. */
-  positionCluster: number;
-  piste: number;
+  time: number;
+  /** Absolute position of the Cluster in the file, relative to the start of the Segment. */
+  clusterPosition: number;
+  track: number;
 };
 
 /**
- * Piste en cours de lecture, tous champs optionnels.
+ * Track currently being read, every field optional.
  *
- * Un `Partial<Piste>` intersecté ne marche pas : `video` y est déjà
- * `PisteVideo | null`, et l'intersection produit un type que rien ne satisfait.
+ * An intersected `Partial<Track>` doesn't work: `video` is already
+ * `VideoTrack | null` there, and the intersection produces a type nothing
+ * can satisfy.
  */
-type PisteEnConstruction = {
-  numero?: number;
+type TrackInProgress = {
+  number?: number;
   type?: number;
   codecId?: string;
   codecPrivate?: Uint8Array | null;
-  dureeParDefaut?: number | null;
-  langue?: string;
-  nom?: string | null;
-  pardefaut?: boolean;
-  forcee?: boolean;
+  defaultDuration?: number | null;
+  language?: string;
+  name?: string | null;
+  default?: boolean;
+  forced?: boolean;
   codecDelay?: number | null;
-  video?: Partial<PisteVideo>;
-  audio?: Partial<PisteAudio>;
+  video?: Partial<VideoTrack>;
+  audio?: Partial<AudioTrack>;
 };
 
-type Cadre = {
+type OpenElement = {
   id: number;
-  /** Position absolue de fin, ou Infinity pour une taille inconnue. */
-  fin: number;
-  /** Profondeur EBML, pour savoir quand un élément de niveau 1 ferme un Cluster. */
-  niveau: number;
+  /** Absolute end position, or Infinity for an unknown size. */
+  end: number;
+  /** EBML depth, to know when a level-1 element closes a Cluster. */
+  level: number;
 };
 
-/** Éléments de niveau 1 : leur apparition ferme tout Cluster de taille inconnue. */
-const NIVEAU_1: ReadonlySet<number> = new Set<number>([
+/** Level-1 elements: their appearance closes any Cluster of unknown size. */
+const LEVEL_1: ReadonlySet<number> = new Set<number>([
   ID.SeekHead,
   ID.Info,
   ID.Tracks,
@@ -100,385 +101,382 @@ const NIVEAU_1: ReadonlySet<number> = new Set<number>([
   ID.Tags,
 ]);
 
-export type OptionsDemuxer = {
-  onEntete?: (info: { timestampScale: number; dureeMs: number | null }) => void;
-  onPistes?: (pistes: Piste[]) => void;
-  onEchantillon?: (e: Echantillon) => void;
-  onCues?: (points: PointCue[]) => void;
-  /** Appelé quand le premier Cluster commence : plus rien de nouveau côté en-tête. */
-  onPret?: () => void;
+export type DemuxerOptions = {
+  onHeader?: (info: { timestampScale: number; durationMs: number | null }) => void;
+  onTracks?: (tracks: Track[]) => void;
+  onSample?: (s: Sample) => void;
+  onCues?: (points: CuePoint[]) => void;
+  /** Called when the first Cluster starts: nothing new is coming on the header side. */
+  onReady?: () => void;
 };
 
 export class MatroskaDemuxer {
-  /** Échelle de temps : nanosecondes par Track Tick. 1 ms par défaut (spec). */
+  /** Time scale: nanoseconds per Track Tick. 1 ms by default (spec). */
   timestampScale = 1_000_000;
-  dureeMs: number | null = null;
-  pistes: Piste[] = [];
-  cues: PointCue[] = [];
+  durationMs: number | null = null;
+  tracks: Track[] = [];
+  cues: CuePoint[] = [];
 
-  /** Position absolue du contenu du Segment — les Cues y sont relatives. */
-  positionSegment = 0;
+  /** Absolute position of the Segment's content — Cues are relative to it. */
+  segmentPosition = 0;
 
   /**
-   * Table des matières du fichier : ID d'élément → position absolue.
+   * File table of contents: element ID → absolute position.
    *
-   * C'est ce qui rend le seek possible sans télécharger le film : les Cues sont
-   * presque toujours écrites À LA FIN (le muxer ne connaît les positions qu'une
-   * fois tout écrit), mais le SeekHead, lui, est au début et dit où les trouver.
-   * Une requête Range suffit alors pour récupérer l'index.
+   * This is what makes seeking possible without downloading the whole movie:
+   * Cues are almost always written AT THE END (the muxer only knows the
+   * positions once everything is written), but the SeekHead is at the start
+   * and says where to find them. A single Range request is then enough to
+   * fetch the index.
    */
   seekHead = new Map<number, number>();
-  private seekIdEnCours: number | null = null;
+  private pendingSeekId: number | null = null;
 
-  private tampon: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
-  /** Décalage dans le fichier du premier octet de `tampon`. */
-  private decalage = 0;
-  private pile: Cadre[] = [];
+  private buffer: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
+  /** Offset in the file of `buffer`'s first byte. */
+  private offset = 0;
+  private stack: OpenElement[] = [];
   private clusterTimestamp = 0;
-  private pistesEmises = false;
-  private pretEmis = false;
+  private tracksEmitted = false;
+  private readyEmitted = false;
 
-  /** Piste en cours de construction (TrackEntry ouvert). */
-  private pisteEnCours: PisteEnConstruction | null = null;
-  private cueEnCours: Partial<PointCue> | null = null;
+  /** Track currently being read (TrackEntry open). */
+  private currentTrack: TrackInProgress | null = null;
+  private currentCue: Partial<CuePoint> | null = null;
 
-  constructor(private readonly opt: OptionsDemuxer = {}) {}
+  constructor(private readonly opt: DemuxerOptions = {}) {}
 
   /**
-   * Repositionne le démultiplexeur à un offset absolu du fichier (après un seek).
-   * Les pistes et l'échelle de temps sont conservées : elles ne changent pas.
+   * Repositions the demuxer at an absolute file offset (after a seek).
+   * Tracks and the time scale are kept: they don't change.
    */
-  repositionner(offsetFichier: number) {
-    this.tampon = new Uint8Array(0);
-    this.decalage = offsetFichier;
-    // On ne garde que le Segment : les cadres internes sont invalidés par le saut.
-    this.pile = this.pile.filter((c) => c.id === ID.Segment);
+  seekTo(fileOffset: number) {
+    this.buffer = new Uint8Array(0);
+    this.offset = fileOffset;
+    // Only the Segment frame survives: inner frames are invalidated by the jump.
+    this.stack = this.stack.filter((f) => f.id === ID.Segment);
     this.clusterTimestamp = 0;
   }
 
-  /** Ajoute des octets et consomme tout ce qui est complet. */
-  alimenter(morceau: Uint8Array<ArrayBufferLike>) {
-    if (this.tampon.length === 0) {
-      this.tampon = morceau;
+  /** Appends bytes and consumes everything that's complete. */
+  feed(chunk: Uint8Array<ArrayBufferLike>) {
+    if (this.buffer.length === 0) {
+      this.buffer = chunk;
     } else {
-      const fusion = new Uint8Array(this.tampon.length + morceau.length);
-      fusion.set(this.tampon, 0);
-      fusion.set(morceau, this.tampon.length);
-      this.tampon = fusion;
+      const merged = new Uint8Array(this.buffer.length + chunk.length);
+      merged.set(this.buffer, 0);
+      merged.set(chunk, this.buffer.length);
+      this.buffer = merged;
     }
-    this.analyser();
+    this.parse();
   }
 
-  private analyser() {
-    const r = new EbmlReader(this.tampon, this.decalage);
+  private parse() {
+    const r = new EbmlReader(this.buffer, this.offset);
 
     for (;;) {
-      // Ferme les cadres terminés avant de lire l'élément suivant.
-      while (this.pile.length > 0) {
-        const haut = this.pile[this.pile.length - 1];
-        if (haut.fin !== Infinity && r.positionAbsolue >= haut.fin) this.fermerCadre();
+      // Close finished elements before reading the next one.
+      while (this.stack.length > 0) {
+        const top = this.stack[this.stack.length - 1];
+        if (top.end !== Infinity && r.absolutePosition >= top.end) this.closeElement();
         else break;
       }
 
-      const debut = r.pos;
-      const id = r.lireId();
+      const start = r.pos;
+      const id = r.readId();
       if (id === null) {
-        r.pos = debut;
+        r.pos = start;
         break;
       }
-      const taille = r.lireTaille();
-      if (taille === null) {
-        r.pos = debut;
+      const size = r.readSize();
+      if (size === null) {
+        r.pos = start;
         break;
       }
 
-      // Un élément de niveau 1 clôt un Cluster de taille inconnue.
-      if (NIVEAU_1.has(id)) {
-        while (this.pile.length > 0 && this.pile[this.pile.length - 1].niveau >= 1) {
-          this.fermerCadre();
+      // A level-1 element closes an unknown-size Cluster.
+      if (LEVEL_1.has(id)) {
+        while (this.stack.length > 0 && this.stack[this.stack.length - 1].level >= 1) {
+          this.closeElement();
         }
       }
 
       if (MASTER_ELEMENTS.has(id)) {
-        this.ouvrirCadre(id, taille === UNKNOWN_SIZE ? Infinity : r.positionAbsolue + taille, r);
+        this.openElement(id, size === UNKNOWN_SIZE ? Infinity : r.absolutePosition + size, r);
         continue;
       }
 
-      // Feuille : il faut tout le contenu pour la lire.
-      if (taille === UNKNOWN_SIZE || r.reste < taille) {
-        r.pos = debut;
+      // Leaf: reading it requires the whole content.
+      if (size === UNKNOWN_SIZE || r.remaining < size) {
+        r.pos = start;
         break;
       }
 
-      const finFeuille = r.pos + taille;
-      this.lireFeuille(id, taille, r);
-      r.pos = finFeuille; // garde-fou : une feuille mal lue ne décale pas le flux
+      const leafEnd = r.pos + size;
+      this.readLeaf(id, size, r);
+      r.pos = leafEnd; // safety net: a mis-read leaf doesn't desync the stream
     }
 
-    // Conserve la queue non consommée.
+    // Keep the unconsumed tail.
     if (r.pos > 0) {
-      this.tampon = this.tampon.slice(r.pos);
-      this.decalage += r.pos;
+      this.buffer = this.buffer.slice(r.pos);
+      this.offset += r.pos;
     }
   }
 
-  private ouvrirCadre(id: number, fin: number, r: EbmlReader) {
-    const niveau =
-      id === ID.Segment || id === ID.EBML ? 0 : NIVEAU_1.has(id) ? 1 : this.pile.length;
-    this.pile.push({ id, fin, niveau });
+  private openElement(id: number, end: number, r: EbmlReader) {
+    const level = id === ID.Segment || id === ID.EBML ? 0 : LEVEL_1.has(id) ? 1 : this.stack.length;
+    this.stack.push({ id, end, level });
 
-    if (id === ID.Segment) this.positionSegment = r.positionAbsolue;
-    if (id === ID.TrackEntry) this.pisteEnCours = {};
-    // L'accumulateur naît avec le CuePoint, PAS avec CueTrackPositions : CueTime
-    // arrive avant, et le remettre à zéro ici perdrait le temps du point de seek.
-    if (id === ID.CuePoint) this.cueEnCours = {};
+    if (id === ID.Segment) this.segmentPosition = r.absolutePosition;
+    if (id === ID.TrackEntry) this.currentTrack = {};
+    // The accumulator is born with CuePoint, NOT with CueTrackPositions: CueTime
+    // arrives first, and resetting it here would lose the seek point's time.
+    if (id === ID.CuePoint) this.currentCue = {};
 
     if (id === ID.Cluster) {
-      // Les pistes sont complètes dès qu'un Cluster commence.
-      if (!this.pistesEmises && this.pistes.length > 0) {
-        this.pistesEmises = true;
-        this.opt.onPistes?.(this.pistes);
+      // Tracks are complete as soon as a Cluster starts.
+      if (!this.tracksEmitted && this.tracks.length > 0) {
+        this.tracksEmitted = true;
+        this.opt.onTracks?.(this.tracks);
       }
-      if (!this.pretEmis) {
-        this.pretEmis = true;
-        this.opt.onPret?.();
+      if (!this.readyEmitted) {
+        this.readyEmitted = true;
+        this.opt.onReady?.();
       }
     }
   }
 
-  private fermerCadre() {
-    const cadre = this.pile.pop();
-    if (!cadre) return;
+  private closeElement() {
+    const frame = this.stack.pop();
+    if (!frame) return;
 
-    if (cadre.id === ID.TrackEntry && this.pisteEnCours) {
-      const p = this.pisteEnCours;
-      if (p.numero != null && p.codecId) {
-        this.pistes.push({
-          numero: p.numero,
-          type: p.type ?? 0,
-          codecId: p.codecId,
-          codecPrivate: p.codecPrivate ?? null,
-          dureeParDefaut: p.dureeParDefaut ?? null,
-          langue: p.langue ?? "und",
-          nom: p.nom ?? null,
-          pardefaut: p.pardefaut ?? true,
-          forcee: p.forcee ?? false,
-          video: p.video
+    if (frame.id === ID.TrackEntry && this.currentTrack) {
+      const t = this.currentTrack;
+      if (t.number != null && t.codecId) {
+        this.tracks.push({
+          number: t.number,
+          type: t.type ?? 0,
+          codecId: t.codecId,
+          codecPrivate: t.codecPrivate ?? null,
+          defaultDuration: t.defaultDuration ?? null,
+          language: t.language ?? "und",
+          name: t.name ?? null,
+          default: t.default ?? true,
+          forced: t.forced ?? false,
+          video: t.video
             ? {
-                largeur: p.video.largeur ?? 0,
-                hauteur: p.video.hauteur ?? 0,
-                // Sans DisplayWidth, l'affichage suit les pixels codés.
-                largeurAffichee: p.video.largeurAffichee ?? p.video.largeur ?? 0,
-                hauteurAffichee: p.video.hauteurAffichee ?? p.video.hauteur ?? 0,
+                width: t.video.width ?? 0,
+                height: t.video.height ?? 0,
+                // Without DisplayWidth, display follows the coded pixels.
+                displayWidth: t.video.displayWidth ?? t.video.width ?? 0,
+                displayHeight: t.video.displayHeight ?? t.video.height ?? 0,
               }
             : null,
-          audio: p.audio
+          audio: t.audio
             ? {
-                frequence: p.audio.frequence ?? 8000,
-                canaux: p.audio.canaux ?? 1,
-                bits: p.audio.bits ?? null,
+                frequency: t.audio.frequency ?? 8000,
+                channels: t.audio.channels ?? 1,
+                bits: t.audio.bits ?? null,
               }
             : null,
-          codecDelay: p.codecDelay ?? null,
+          codecDelay: t.codecDelay ?? null,
         });
       }
-      this.pisteEnCours = null;
+      this.currentTrack = null;
     }
 
-    if (cadre.id === ID.Tracks && !this.pistesEmises && this.pistes.length > 0) {
-      this.pistesEmises = true;
-      this.opt.onPistes?.(this.pistes);
+    if (frame.id === ID.Tracks && !this.tracksEmitted && this.tracks.length > 0) {
+      this.tracksEmitted = true;
+      this.opt.onTracks?.(this.tracks);
     }
 
-    if (cadre.id === ID.CuePoint) this.cueEnCours = null;
+    if (frame.id === ID.CuePoint) this.currentCue = null;
 
-    if (cadre.id === ID.Cues) {
-      // Les Cues d'un fichier bien formé sont déjà triées, mais rien ne l'impose :
-      // la recherche binaire du seek, elle, l'exige.
-      this.cues.sort((a, b) => a.temps - b.temps);
+    if (frame.id === ID.Cues) {
+      // Cues in a well-formed file are already sorted, but nothing enforces
+      // it — the seek binary search, on the other hand, requires it.
+      this.cues.sort((a, b) => a.time - b.time);
       this.opt.onCues?.(this.cues);
     }
   }
 
-  private lireFeuille(id: number, taille: number, r: EbmlReader) {
-    const p = this.pisteEnCours;
-    const dansAudio = this.pile.some((c) => c.id === ID.Audio);
-    const dansVideo = this.pile.some((c) => c.id === ID.Video);
+  private readLeaf(id: number, size: number, r: EbmlReader) {
+    const t = this.currentTrack;
+    const inAudio = this.stack.some((f) => f.id === ID.Audio);
+    const inVideo = this.stack.some((f) => f.id === ID.Video);
 
     switch (id) {
       // --- Info ---
       case ID.TimestampScale:
-        this.timestampScale = r.lireUint(taille);
+        this.timestampScale = r.readUint(size);
         break;
       case ID.Duration: {
-        const ticks = r.lireFloat(taille);
-        this.dureeMs = (ticks * this.timestampScale) / 1e6;
-        this.opt.onEntete?.({ timestampScale: this.timestampScale, dureeMs: this.dureeMs });
+        const ticks = r.readFloat(size);
+        this.durationMs = (ticks * this.timestampScale) / 1e6;
+        this.opt.onHeader?.({ timestampScale: this.timestampScale, durationMs: this.durationMs });
         break;
       }
 
       // --- TrackEntry ---
       case ID.TrackNumber:
-        if (p) p.numero = r.lireUint(taille);
+        if (t) t.number = r.readUint(size);
         break;
       case ID.TrackType:
-        if (p) p.type = r.lireUint(taille);
+        if (t) t.type = r.readUint(size);
         break;
       case ID.CodecID:
-        if (p) p.codecId = r.lireChaine(taille);
+        if (t) t.codecId = r.readString(size);
         break;
       case ID.CodecPrivate:
-        if (p) p.codecPrivate = r.lireOctets(taille);
+        if (t) t.codecPrivate = r.readBytes(size);
         break;
       case ID.DefaultDuration:
-        if (p) p.dureeParDefaut = r.lireUint(taille);
+        if (t) t.defaultDuration = r.readUint(size);
         break;
       case ID.Language:
-        if (p && !p.langue) p.langue = r.lireChaine(taille);
+        if (t && !t.language) t.language = r.readString(size);
         break;
       case ID.LanguageBCP47:
-        // BCP47 est plus précis (« fr-FR ») : il gagne sur Language (« fre »).
-        if (p) p.langue = r.lireChaine(taille);
+        // BCP47 is more precise ("fr-FR") than Language ("fre") and wins over it.
+        if (t) t.language = r.readString(size);
         break;
       case ID.Name:
-        if (p) p.nom = r.lireChaine(taille);
+        if (t) t.name = r.readString(size);
         break;
       case ID.FlagDefault:
-        if (p) p.pardefaut = r.lireUint(taille) !== 0;
+        if (t) t.default = r.readUint(size) !== 0;
         break;
       case ID.FlagForced:
-        if (p) p.forcee = r.lireUint(taille) !== 0;
+        if (t) t.forced = r.readUint(size) !== 0;
         break;
       case ID.CodecDelay:
-        if (p) p.codecDelay = r.lireUint(taille);
+        if (t) t.codecDelay = r.readUint(size);
         break;
 
       // --- Video ---
       case ID.PixelWidth:
-        if (p && dansVideo) (p.video ??= {}).largeur = r.lireUint(taille);
+        if (t && inVideo) (t.video ??= {}).width = r.readUint(size);
         break;
       case ID.PixelHeight:
-        if (p && dansVideo) (p.video ??= {}).hauteur = r.lireUint(taille);
+        if (t && inVideo) (t.video ??= {}).height = r.readUint(size);
         break;
       case ID.DisplayWidth:
-        if (p && dansVideo) (p.video ??= {}).largeurAffichee = r.lireUint(taille);
+        if (t && inVideo) (t.video ??= {}).displayWidth = r.readUint(size);
         break;
       case ID.DisplayHeight:
-        if (p && dansVideo) (p.video ??= {}).hauteurAffichee = r.lireUint(taille);
+        if (t && inVideo) (t.video ??= {}).displayHeight = r.readUint(size);
         break;
 
       // --- Audio ---
       case ID.SamplingFrequency:
-        if (p && dansAudio) (p.audio ??= {}).frequence = r.lireFloat(taille);
+        if (t && inAudio) (t.audio ??= {}).frequency = r.readFloat(size);
         break;
       case ID.OutputSamplingFrequency:
-        // Fréquence de sortie (AAC HE double la fréquence) : c'est elle qui compte.
-        if (p && dansAudio) (p.audio ??= {}).frequence = r.lireFloat(taille);
+        // Output frequency (AAC HE doubles the frequency): this is the one that counts.
+        if (t && inAudio) (t.audio ??= {}).frequency = r.readFloat(size);
         break;
       case ID.Channels:
-        if (p && dansAudio) (p.audio ??= {}).canaux = r.lireUint(taille);
+        if (t && inAudio) (t.audio ??= {}).channels = r.readUint(size);
         break;
       case ID.BitDepth:
-        if (p && dansAudio) (p.audio ??= {}).bits = r.lireUint(taille);
+        if (t && inAudio) (t.audio ??= {}).bits = r.readUint(size);
         break;
 
       // --- Cluster ---
       case ID.Timestamp:
-        this.clusterTimestamp = r.lireUint(taille);
+        this.clusterTimestamp = r.readUint(size);
         break;
       case ID.SimpleBlock:
-        this.emettreBloc(r.lireOctets(taille), true, null);
+        this.emitBlock(r.readBytes(size), true, null);
         break;
       case ID.Block:
-        // Dans un BlockGroup : le keyframe se déduit de l'absence de ReferenceBlock,
-        // mais on ne l'a pas encore lu. On tranche à la fermeture du groupe — en
-        // pratique, un BlockGroup sans ReferenceBlock est rare et non-clé le plus
-        // souvent, donc on le marque non-clé et on laisse le lecteur s'en remettre.
-        this.emettreBloc(r.lireOctets(taille), false, null);
+        // Inside a BlockGroup: the keyframe is inferred from the absence of a
+        // ReferenceBlock, which hasn't been read yet. It's settled when the
+        // group closes — in practice, a BlockGroup with no ReferenceBlock is
+        // rare and usually non-key, so it's marked non-key here and left for
+        // the player to sort out.
+        this.emitBlock(r.readBytes(size), false, null);
         break;
 
-      // --- SeekHead : la table des matières du fichier ---
+      // --- SeekHead: the file's table of contents ---
       case ID.SeekID: {
-        const octets = r.lireOctets(taille);
-        let id2 = 0;
-        for (const o of octets) id2 = id2 * 256 + o;
-        this.seekIdEnCours = id2;
+        const bytes = r.readBytes(size);
+        let value = 0;
+        for (const b of bytes) value = value * 256 + b;
+        this.pendingSeekId = value;
         break;
       }
       case ID.SeekPosition: {
-        const position = r.lireUint(taille);
-        if (this.seekIdEnCours !== null) {
-          // Relative au Segment, comme les Cues.
-          this.seekHead.set(this.seekIdEnCours, this.positionSegment + position);
-          this.seekIdEnCours = null;
+        const position = r.readUint(size);
+        if (this.pendingSeekId !== null) {
+          // Relative to the Segment, like Cues.
+          this.seekHead.set(this.pendingSeekId, this.segmentPosition + position);
+          this.pendingSeekId = null;
         }
         break;
       }
 
       // --- Cues ---
       case ID.CueTime:
-        if (this.cueEnCours === null) this.cueEnCours = {};
-        this.cueEnCours.temps = r.lireUint(taille);
+        if (this.currentCue === null) this.currentCue = {};
+        this.currentCue.time = r.readUint(size);
         break;
       case ID.CueTrack:
-        if (this.cueEnCours) this.cueEnCours.piste = r.lireUint(taille);
+        if (this.currentCue) this.currentCue.track = r.readUint(size);
         break;
       case ID.CueClusterPosition: {
-        const position = r.lireUint(taille);
-        if (this.cueEnCours?.temps != null) {
+        const position = r.readUint(size);
+        if (this.currentCue?.time != null) {
           this.cues.push({
-            temps: this.cueEnCours.temps,
-            // Les positions des Cues sont relatives au début du Segment.
-            positionCluster: this.positionSegment + position,
-            piste: this.cueEnCours.piste ?? 1,
+            time: this.currentCue.time,
+            // Cue positions are relative to the start of the Segment.
+            clusterPosition: this.segmentPosition + position,
+            track: this.currentCue.track ?? 1,
           });
         }
         break;
       }
 
       default:
-        break; // élément non utilisé : `r.pos` est recalé par l'appelant
+        break; // unused element: `r.pos` is realigned by the caller
     }
   }
 
-  private emettreBloc(donnees: Uint8Array, simple: boolean, duree: number | null) {
-    const bloc = decoderBloc(donnees, simple);
-    if (!bloc) return;
+  private emitBlock(data: Uint8Array, simple: boolean, duration: number | null) {
+    const block = decodeBlock(data, simple);
+    if (!block) return;
 
-    const base = this.clusterTimestamp + bloc.timestampRelatif;
-    // Trames lacées : elles partagent le timestamp du bloc. Sans DefaultDuration on
-    // ne peut pas les répartir — les muxers qui lacent l'écrivent toujours.
-    const pas =
-      bloc.trames.length > 1 && this.pistes.length > 0
-        ? this.dureeTicks(bloc.trackNumber)
-        : 0;
+    const base = this.clusterTimestamp + block.relativeTimestamp;
+    // Laced frames share the block's timestamp. Without DefaultDuration they
+    // can't be spread apart — muxers that lace always write it.
+    const step =
+      block.frames.length > 1 && this.tracks.length > 0 ? this.durationTicks(block.trackNumber) : 0;
 
-    bloc.trames.forEach((trame, i) => {
-      this.opt.onEchantillon?.({
-        piste: bloc.trackNumber,
-        timestamp: base + (pas ? pas * i : 0),
-        duree: duree ?? (pas || null),
-        keyframe: bloc.keyframe,
-        donnees: trame,
+    block.frames.forEach((frame, i) => {
+      this.opt.onSample?.({
+        track: block.trackNumber,
+        timestamp: base + (step ? step * i : 0),
+        duration: duration ?? (step || null),
+        keyframe: block.keyframe,
+        data: frame,
       });
     });
   }
 
-  /** DefaultDuration d'une piste, converti de nanosecondes en Track Ticks. */
-  private dureeTicks(numeroPiste: number): number {
-    const piste = this.pistes.find((p) => p.numero === numeroPiste);
-    if (!piste?.dureeParDefaut) return 0;
-    return piste.dureeParDefaut / this.timestampScale;
+  /** A track's DefaultDuration, converted from nanoseconds to Track Ticks. */
+  private durationTicks(trackNumber: number): number {
+    const track = this.tracks.find((t) => t.number === trackNumber);
+    if (!track?.defaultDuration) return 0;
+    return track.defaultDuration / this.timestampScale;
   }
 
-  /** Pistes utilisables triées : vidéo puis audio, la piste « par défaut » en tête. */
-  pistesParType(type: number): Piste[] {
-    return this.pistes
-      .filter((p) => p.type === type)
-      .sort((a, b) => Number(b.pardefaut) - Number(a.pardefaut));
+  /** Usable tracks sorted: video then audio, the "default" track first. */
+  tracksByType(type: number): Track[] {
+    return this.tracks.filter((t) => t.type === type).sort((a, b) => Number(b.default) - Number(a.default));
   }
 
-  get pisteVideo(): Piste | null {
-    return this.pistesParType(TrackType.VIDEO)[0] ?? null;
+  get videoTrack(): Track | null {
+    return this.tracksByType(TrackType.VIDEO)[0] ?? null;
   }
 }
