@@ -1,7 +1,7 @@
 {
   "name": "cinemux",
   "version": "0.1.0",
-  "description": "Play MKV files in a browser by remuxing Matroska to fMP4. No WASM, no transcoding.",
+  "description": "Play MKV files in a browser by remuxing Matroska to fragmented MP4 for MediaSource Extensions. No WASM, no transcoding, zero runtime dependencies.",
   "type": "module",
   "license": "MIT",
   "main": "./dist/index.js",
@@ -30,9 +30,19 @@
     "mkv",
     "matroska",
     "mp4",
+    "fmp4",
     "remux",
+    "remuxer",
     "mse",
     "media-source",
-    "video"
+    "media-source-extensions",
+    "isobmff",
+    "video-player",
+    "video",
+    "webcodecs",
+    "ac3",
+    "h264",
+    "hevc",
+    "av1"
   ]
 }
