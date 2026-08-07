@@ -14,14 +14,13 @@ import type { FromWorkerMessage, ToWorkerMessage } from "./ac3-worker.js";
  *
  * DECODING RUNS IN A WORKER (`ac3-worker.ts`), not here — see that file for
  * why. This class only does the cheap part: turn PCM the worker already
- * produced into an `AudioBuffer` and schedule it.
+ * produced into an `AudioBuffer` and schedule it. The worker also downmixes
+ * to stereo (`codecs/ac3/downmix.ts`) before handing PCM back — this class
+ * always receives exactly 2 channels, whatever the source's acmod was, so it
+ * never has to reason about channel order itself.
  *
- * KNOWN LIMITATIONS, accepted for now (not bugs — see `trame.ts`):
- *  - the LFE ("`.1`") channel is not decoded at all;
- *  - channel order follows the bitstream order (acmod), not necessarily the
- *    standard WAV/Web Audio order for 5.1 (L,C,R,Ls,Rs vs L,R,C,LFE,...).
- * Mono and stereo (the most common cases for a French dub) have NEITHER
- * limitation: no channel-order ambiguity with 1-2 full-bandwidth channels.
+ * KNOWN LIMITATION, accepted for now (not a bug — see `trame.ts`): the LFE
+ * ("`.1`") channel is not decoded at all.
  */
 
 export type Ac3AudioOptions = {

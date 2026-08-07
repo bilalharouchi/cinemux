@@ -803,8 +803,10 @@ function fastgainAt(code: number): number {
  *     — the IMDCT always assumes a 256-coefficient long block.
  *   - Real 5.1/multichannel: coupling is verified in stereo (acmod=2): the
  *     distribution above is generic (loops over `nch`), but no real 5.1
- *     fixture has exercised it yet. Output channel order (bitstream acmod
- *     vs. WAV/Web Audio convention) also not yet handled.
+ *     fixture has exercised it yet. (Output channel order — bitstream acmod
+ *     vs. WAV/Web Audio convention — IS handled now, see `downmix.ts`;
+ *     this point is only about coupling's own decode correctness on a real
+ *     5.1 stream, not about where the decoded channels end up.)
  *   - Performance: the IMDCT is O(N²) (precomputed cosine table, but no
  *     FFT) — correct before fast, to revisit if real-time playback
  *     struggles on an actual multichannel film.

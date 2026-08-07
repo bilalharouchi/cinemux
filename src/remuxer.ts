@@ -81,13 +81,40 @@ function defaultSupport(mime: string): boolean {
   return MediaSource.isTypeSupported(mime);
 }
 
-/** Do two language codes name the same language? (`fre`, `fra`, `fr`, `fr-FR`) */
-function sameLanguage(a: string, b: string): boolean {
-  const n = (s: string) => {
-    const base = s.toLowerCase().split(/[-_]/)[0];
-    return base === "fra" || base === "fre" ? "fr" : base;
-  };
-  return n(a) === n(b);
+/**
+ * ISO 639-2 (3-letter, what Matroska language tags actually use) to ISO 639-1
+ * (2-letter, what callers pass as `preferredLanguage`). Only the languages
+ * `release-parser.ts`'s `foreignLangTags` can detect need an entry here.
+ */
+const ISO_639_2_TO_1: Record<string, string> = {
+  fra: "fr",
+  fre: "fr",
+  ger: "de",
+  deu: "de",
+  spa: "es",
+  ita: "it",
+  rus: "ru",
+  por: "pt",
+  dut: "nl",
+  nld: "nl",
+  pol: "pl",
+  kor: "ko",
+  jpn: "ja",
+  hin: "hi",
+  tam: "ta",
+  tel: "te",
+  tur: "tr",
+  ara: "ar",
+};
+
+export function canonical(code: string): string {
+  const base = code.toLowerCase().split(/[-_]/)[0];
+  return ISO_639_2_TO_1[base] ?? base;
+}
+
+/** Do two language codes name the same language? (`ger`, `deu`, `de`, `de-DE`) */
+export function sameLanguage(a: string, b: string): boolean {
+  return canonical(a) === canonical(b);
 }
 
 export class Remuxer {

@@ -3,12 +3,35 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Remuxer, type Diagnostic } from "../src/remuxer.js";
+import { Remuxer, sameLanguage, type Diagnostic } from "../src/remuxer.js";
 
 /**
  * These tests judge the output with ffprobe, not with our own convictions.
  * An fMP4 that "looks right" and that no demuxer can read back has no value.
  */
+
+describe("sameLanguage", () => {
+  // Pure string comparison, no MKV involved — a fixture would test nothing
+  // a unit test doesn't already cover more directly.
+  it("matches ISO 639-2 tags against their ISO 639-1 form, not just French", () => {
+    expect(sameLanguage("ger", "de")).toBe(true);
+    expect(sameLanguage("deu", "de")).toBe(true);
+    expect(sameLanguage("spa", "es")).toBe(true);
+    expect(sameLanguage("ita", "it")).toBe(true);
+    expect(sameLanguage("fre", "fr")).toBe(true);
+    expect(sameLanguage("fra", "fr")).toBe(true);
+  });
+
+  it("still rejects genuinely different languages", () => {
+    expect(sameLanguage("ger", "fr")).toBe(false);
+    expect(sameLanguage("eng", "de")).toBe(false);
+  });
+
+  it("ignores a region suffix (`de-DE`, `fr_CA`)", () => {
+    expect(sameLanguage("de-DE", "de")).toBe(true);
+    expect(sameLanguage("fr_CA", "fra")).toBe(true);
+  });
+});
 
 function readFixture(name: string): Uint8Array {
   return new Uint8Array(readFileSync(new URL(`./fixtures/${name}`, import.meta.url)));

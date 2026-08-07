@@ -20,6 +20,7 @@
 import { decodeFrame as decodeAc3Frame, readHeader } from "./codecs/ac3/trame.js";
 import { BitReader } from "./codecs/ac3/bits.js";
 import { ChannelSynthesis } from "./codecs/ac3/synthese.js";
+import { downmixToStereo } from "./codecs/ac3/downmix.js";
 
 export type ToWorkerMessage = { type: "sample"; data: Uint8Array; timestampS: number } | { type: "seek" };
 
@@ -28,6 +29,10 @@ export type FromWorkerMessage = {
   // `<ArrayBuffer>`, not the default `<ArrayBufferLike>`: these are always
   // plain `new Float32Array(n)` allocations, never `SharedArrayBuffer` —
   // `AudioBuffer.copyToChannel` (audio-ac3.ts) is typed to require exactly that.
+  //
+  // Always exactly 2 entries (downmixed — see downmixToStereo below),
+  // whatever the source's acmod was: audio-ac3.ts never has to reason about
+  // channel count or order.
   channels: Float32Array<ArrayBuffer>[];
   timestampS: number;
   sampleRate: number;
@@ -116,10 +121,13 @@ function handleFrame(frame: Uint8Array, timestampS: number) {
     audioSecondsDecoded = 0;
   }
 
-  const message: FromWorkerMessage = { type: "pcm", channels: perChannel, timestampS, sampleRate };
+  // Always exactly 2 channels out, whatever acmod came in — the browser has
+  // no defined up/down-mix rule outside 1/2/4/6 channels (see downmix.ts).
+  const stereo = downmixToStereo(result.header.acmod, perChannel) as Float32Array<ArrayBuffer>[];
+  const message: FromWorkerMessage = { type: "pcm", channels: stereo, timestampS, sampleRate };
   worker.postMessage(
     message,
-    perChannel.map((c) => c.buffer),
+    stereo.map((c) => c.buffer),
   );
 }
 
